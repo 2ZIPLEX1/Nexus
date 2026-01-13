@@ -2018,7 +2018,8 @@ class TradingBotGUI(ctk.CTk):
 
             # Сортировка по профиту если включена
             if self.sort_by_profit and items:
-                items.sort(key=lambda x: x.get('profit_pct', 0), reverse=True)
+                # Обрабатываем None значения: ставим их в конец списка (-999)
+                items.sort(key=lambda x: x.get('profit_pct') if x.get('profit_pct') is not None else -999, reverse=True)
 
             # Обновляем счётчик предметов
             if hasattr(self, 'parser_items_count_label'):
@@ -2088,11 +2089,14 @@ class TradingBotGUI(ctk.CTk):
                 market_hash_name = item.get('market_hash_name', 'N/A')
 
                 # Получаем профит (используем recommended если есть, иначе обычный)
-                profit_pct = item.get('profit_pct', 0)
+                # Обрабатываем None значения корректно
+                profit_pct = item.get('profit_pct') if item.get('profit_pct') is not None else 0
                 recommended_profit_pct = item.get('recommended_profit_pct')
                 best_profit = recommended_profit_pct if recommended_profit_pct is not None else profit_pct
 
-                # Цвет в зависимости от профита
+                # Цвет в зависимости от профита (обрабатываем None)
+                if best_profit is None:
+                    best_profit = 0
                 profit_color = "green" if best_profit >= 5 else "orange" if best_profit >= 0 else "red"
 
                 # Название предмета (только отображение)
