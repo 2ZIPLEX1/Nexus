@@ -23,7 +23,7 @@ class SteamMarketScraper:
         'CDN$': 'CAD', 'A$': 'AUD', 'R$': 'BRL',
         '₴': 'UAH', 'kr': 'SEK', 'zł': 'PLN',
         '₹': 'INR', 'CHF': 'CHF', '元': 'CNY',
-        '฿': 'THB', '₩': 'KRW',
+        '฿': 'THB', '₩': 'KRW', '₸': 'KZT',
     }
 
     def __init__(self, cookies: Dict[str, str], proxy: Optional[str] = None):
@@ -136,8 +136,8 @@ class SteamMarketScraper:
 
             # Метод 3: Ищем любое упоминание кошелька
             wallet_patterns = [
-                r'wallet.*?balance.*?([0-9\s,.]+)\s*([₽$€£¥])',
-                r'([₽$€£¥])\s*([0-9\s,.]+)',
+                r'wallet.*?balance.*?([0-9\s,.]+)\s*([₽$€£¥₸₴₩])',
+                r'([₽$€£¥₸₴₩])\s*([0-9\s,.]+)',
                 r'balance.*?([0-9\s,.]+)\s*([A-Z]{3})',
             ]
 
@@ -298,6 +298,8 @@ class SteamMarketScraper:
             16: 'KRW', 17: 'TRY', 18: 'UAH', 19: 'MXN', 20: 'CAD',
             21: 'AUD', 22: 'NZD', 23: 'CNY', 24: 'INR', 25: 'CLP',
             26: 'PEN', 27: 'COP', 28: 'ZAR', 29: 'HKD', 30: 'TWD',
+            31: 'SAR', 32: 'AED', 33: 'ARS', 34: 'ILS', 35: 'KWD',
+            36: 'QAR', 37: 'KZT', 38: 'CRC', 39: 'UYU',
         }
         return currency_map.get(code, 'USD')
 
