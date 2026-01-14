@@ -2873,32 +2873,64 @@ class TradingBotGUI(ctk.CTk):
         def detect_thread():
             try:
                 from src.steam_market_scraper import SteamMarketScraper
+                import json
+                import os
 
                 self._log(f"Определение валюты для аккаунта {account.name}...")
 
-                # Проверяем, залогинен ли аккаунт
-                if not account.is_logged_in():
-                    self._log(f"Аккаунт {account.name} не залогинен. Попытка входа...")
-                    success = account.login()
-                    if not success:
-                        self._log(f"Не удалось войти в аккаунт {account.name}")
+                cookies = None
+
+                # Попытка 1: Читаем cookies из файла steam_cookies.json (как в get_balance.py)
+                if os.path.exists('steam_cookies.json'):
+                    try:
+                        with open('steam_cookies.json', 'r', encoding='utf-8') as f:
+                            cookies = json.load(f)
+                        if cookies and 'sessionid' in cookies:
+                            sessionid_preview = cookies.get('sessionid', '')[:10] + '...'
+                            has_steamlogin = 'YES' if cookies.get('steamLoginSecure') else 'NO'
+                            steam_country = cookies.get('steamCountry', 'N/A')
+                            self._log(f"Используем cookies из steam_cookies.json")
+                            self._log(f"  sessionid={sessionid_preview}, steamLoginSecure={has_steamlogin}, steamCountry={steam_country}")
+                        else:
+                            cookies = None
+                    except Exception as e:
+                        self._log(f"Ошибка чтения steam_cookies.json: {e}")
+                        cookies = None
+
+                # Попытка 2: Получаем cookies из steam_client (если не получили из файла)
+                if not cookies:
+                    self._log(f"Файл steam_cookies.json не найден, пробуем получить из сессии аккаунта...")
+
+                    # Проверяем, залогинен ли аккаунт
+                    if not account.is_logged_in():
+                        self._log(f"Аккаунт {account.name} не залогинен. Попытка входа...")
+                        success = account.login()
+                        if not success:
+                            self._log(f"Не удалось войти в аккаунт {account.name}")
+                            return
+
+                    # Получаем cookies из steam_client
+                    steam_client = account.steam_client
+                    if not steam_client or not steam_client._session:
+                        self._log(f"Нет активной сессии Steam для {account.name}")
                         return
 
-                # Получаем cookies из steam_client
-                steam_client = account.steam_client
-                if not steam_client or not steam_client._session:
-                    self._log(f"Нет активной сессии Steam для {account.name}")
-                    return
+                    # Формируем cookies для SteamMarketScraper
+                    cookies = {}
+                    for cookie in steam_client._session.cookies:
+                        if cookie.name in ['sessionid', 'steamLoginSecure', 'steamCountry']:
+                            cookies[cookie.name] = cookie.value
 
-                # Формируем cookies для SteamMarketScraper
-                cookies = {}
-                for cookie in steam_client._session.cookies:
-                    if cookie.name in ['sessionid', 'steamLoginSecure', 'steamCountry']:
-                        cookies[cookie.name] = cookie.value
+                    if not cookies.get('sessionid'):
+                        self._log(f"Не найден sessionid в cookies для {account.name}")
+                        return
 
-                if not cookies.get('sessionid'):
-                    self._log(f"Не найден sessionid в cookies для {account.name}")
-                    return
+                    # Логируем cookies для отладки
+                    sessionid_preview = cookies.get('sessionid', '')[:10] + '...' if cookies.get('sessionid') else 'N/A'
+                    has_steamlogin = 'YES' if cookies.get('steamLoginSecure') else 'NO'
+                    steam_country = cookies.get('steamCountry', 'N/A')
+                    self._log(f"Используем cookies из сессии аккаунта")
+                    self._log(f"  sessionid={sessionid_preview}, steamLoginSecure={has_steamlogin}, steamCountry={steam_country}")
 
                 self._log(f"Получение баланса через SteamMarketScraper...")
 
