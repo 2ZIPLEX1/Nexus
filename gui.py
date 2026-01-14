@@ -2515,16 +2515,33 @@ class TradingBotGUI(ctk.CTk):
             # Try to use existing logged-in account if available
             steam_client = None
             csgotm_client = None
+            account_currency = None
 
             if self.account_manager and len(self.account_manager.accounts) > 0:
                 account = self.account_manager.accounts[0]
+
+                # Try to login if not logged in
+                if not account.is_logged_in():
+                    self._log(f"⚠️ Аккаунт {account.name} не залогинен, попытка входа...")
+                    try:
+                        if account.login():
+                            self._log(f"✅ Успешный вход в аккаунт {account.name}")
+                        else:
+                            self._log(f"⚠️ Не удалось войти в аккаунт {account.name}")
+                    except Exception as e:
+                        self._log(f"⚠️ Ошибка входа: {e}")
+
+                # Use account's client if logged in
                 if account.is_logged_in():
                     steam_client = account.steam_client
                     csgotm_client = account.csgotm_client
+                    account_currency = account.config.currency
+                    self._log(f"✅ Используем аккаунт {account.name}, валюта: {account_currency}")
 
             # If no logged-in account, create clients without auth (for public price checks)
             # Create with proxy support
             if not steam_client:
+                self._log(f"⚠️ Нет залогиненного аккаунта, используем публичный доступ (валюта: RUB по умолчанию)")
                 steam_client = SteamClient()
                 # Set proxy session if available
                 if proxies_list:
@@ -2577,6 +2594,10 @@ class TradingBotGUI(ctk.CTk):
                         continue
 
                     csgotm_price = csgotm_price_data['min_price']
+
+                    # Log prices for debugging
+                    steam_sell_str = f"{steam_lowest_sell:.2f}" if steam_lowest_sell else "N/A"
+                    self._log(f"  💰 Цены: Steam buy={steam_buy_order:.2f}, sell={steam_sell_str}, CSGO.TM={csgotm_price:.2f}")
 
                     # Calculate profit
                     net_revenue = csgotm_price * 0.93
@@ -2844,28 +2865,55 @@ class TradingBotGUI(ctk.CTk):
 
     def _detect_account_currency(self, account):
         """
-        Определить валюту аккаунта автоматически из Steam.
+        Определить валюту аккаунта автоматически из Steam используя SteamMarketScraper.
 
         Args:
             account: Account instance
         """
         def detect_thread():
             try:
-                self._log(f"🔍 Определение валюты для аккаунта {account.name}...")
+                from src.steam_market_scraper import SteamMarketScraper
+
+                self._log(f"Определение валюты для аккаунта {account.name}...")
 
                 # Проверяем, залогинен ли аккаунт
                 if not account.is_logged_in():
-                    self._log(f"⚠️ Аккаунт {account.name} не залогинен. Попытка входа...")
+                    self._log(f"Аккаунт {account.name} не залогинен. Попытка входа...")
                     success = account.login()
                     if not success:
-                        self._log(f"❌ Не удалось войти в аккаунт {account.name}")
+                        self._log(f"Не удалось войти в аккаунт {account.name}")
                         return
 
-                # Определяем валюту
-                detected_currency = account.detect_currency()
+                # Получаем cookies из steam_client
+                steam_client = account.steam_client
+                if not steam_client or not steam_client._session:
+                    self._log(f"Нет активной сессии Steam для {account.name}")
+                    return
 
-                if detected_currency:
-                    self._log(f"✅ Валюта аккаунта {account.name}: {detected_currency}")
+                # Формируем cookies для SteamMarketScraper
+                cookies = {}
+                for cookie in steam_client._session.cookies:
+                    if cookie.name in ['sessionid', 'steamLoginSecure', 'steamCountry']:
+                        cookies[cookie.name] = cookie.value
+
+                if not cookies.get('sessionid'):
+                    self._log(f"Не найден sessionid в cookies для {account.name}")
+                    return
+
+                self._log(f"Получение баланса через SteamMarketScraper...")
+
+                # Используем SteamMarketScraper для получения баланса и валюты
+                scraper = SteamMarketScraper(cookies)
+                result = scraper.get_balance()
+
+                if result['success']:
+                    detected_currency = result['currency']
+                    balance = result['balance']
+
+                    self._log(f"Валюта: {detected_currency}, Баланс: {balance} {detected_currency}")
+
+                    # Обновляем валюту в конфигурации аккаунта
+                    account.config.currency = detected_currency
 
                     # Обновляем отображение
                     self.after(0, self._refresh_accounts_list)
@@ -2873,11 +2921,14 @@ class TradingBotGUI(ctk.CTk):
                     # Сохраняем изменения
                     self._save_accounts_config()
                 else:
-                    self._log(f"❌ Не удалось определить валюту для {account.name}")
+                    error_msg = result.get('error', 'Unknown error')
+                    self._log(f"Не удалось получить баланс: {error_msg}")
 
             except Exception as e:
                 logger.error(f"Error detecting currency for {account.name}: {e}")
-                self._log(f"❌ Ошибка определения валюты: {e}")
+                import traceback
+                traceback.print_exc()
+                self._log(f"Ошибка определения валюты: {e}")
 
         # Запускаем в отдельном потоке
         thread = threading.Thread(target=detect_thread, daemon=True)
