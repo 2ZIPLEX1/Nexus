@@ -2251,7 +2251,7 @@ class TradingBotGUI(ctk.CTk):
         try:
             from src.steam_client import SteamClient
             from src.csgotm_client import CsgoTmClient
-            from src.steam_client_httpx import create_session_with_proxy
+            import requests
             import os
 
             # Получаем минимальный профит из конфига (используем self.bot_config напрямую)
@@ -2275,12 +2275,13 @@ class TradingBotGUI(ctk.CTk):
                     proxy = random.choice(proxies_list)
                     self._log(f"Используем прокси для обхода rate limit: {proxy.split('@')[-1] if '@' in proxy else proxy}")
 
-                    # Создаём сессию с поддержкой SOCKS5 через httpx
-                    session = create_session_with_proxy(proxy=proxy, timeout=30.0)
+                    # Создаём сессию с прокси
+                    session = requests.Session()
+                    session.proxies = {'http': proxy, 'https': proxy}
                 else:
                     # Создаём обычную сессию если нет прокси
                     self._log(f"ℹ️ Работаем без прокси (возможны ограничения по rate limit)")
-                    session = create_session_with_proxy(proxy=None, timeout=30.0)
+                    session = requests.Session()
 
                 # Создаём клиенты напрямую
                 steam_client = SteamClient()
@@ -2503,8 +2504,9 @@ class TradingBotGUI(ctk.CTk):
         try:
             from src.steam_client import SteamClient
             from src.csgotm_client import CsgoTmClient
-            from src.steam_client_httpx import create_session_with_proxy
+            import requests
             import random
+            import os
 
             # Загружаем прокси
             proxy_file = self.bot_config.get('proxy_file', 'proxies.txt')
@@ -2527,7 +2529,8 @@ class TradingBotGUI(ctk.CTk):
                 # Set proxy session if available
                 if proxies_list:
                     proxy = random.choice(proxies_list)
-                    session = create_session_with_proxy(proxy=proxy, timeout=30.0)
+                    session = requests.Session()
+                    session.proxies = {'http': proxy, 'https': proxy}
                     steam_client._session = session
                     steam_client.REQUEST_DELAY = 0.5
                     self._log(f"ℹ️ Используем прокси для пересканирования")
