@@ -382,7 +382,9 @@ class SteamMarketAPI:
         # Wait for underlying connections to close
         await asyncio.sleep(0.25)
 
-    async def check_proxy(self, proxy_url: str, timeout: float = 10, check_steam_api: bool = True) -> bool:
+    # timeout=20, а не 10: SOCKS5-туннель до Steam через океан на 10 с не всегда
+    # успевает, и живые прокси отсеивались как «Proxy timeout».
+    async def check_proxy(self, proxy_url: str, timeout: float = 20, check_steam_api: bool = True) -> bool:
         """
         Check if proxy is working (basic + Steam API test).
 
@@ -400,8 +402,17 @@ class SteamMarketAPI:
                 connector=connector,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as session:
+                # 429 — это НЕ поломка прокси: соединение установлено, Steam ответил
+                # и лишь просит сбавить темп. Раньше по нему прокси уходила в брак;
+                # когда так отсеивались все, список обнулялся и сканер шёл в Steam
+                # напрямую с IP сервера, получая тот же 429 уже на сам сервер.
+                # Держим такие прокси в пуле — ограничение снимается само.
+
                 # Test 1: Basic connectivity
                 async with session.get(f"{self.BASE_URL}/") as response:
+                    if response.status == 429:
+                        logger.debug("Proxy alive but rate limited (429) — keeping it")
+                        return True
                     if response.status != 200:
                         logger.debug(f"Proxy failed basic test: status {response.status}")
                         return False
@@ -420,8 +431,8 @@ class SteamMarketAPI:
 
                     async with session.get(api_url, params=params) as response:
                         if response.status == 429:
-                            logger.debug(f"Proxy has rate limit (429)")
-                            return False
+                            logger.debug("Proxy alive but API rate limited (429) — keeping it")
+                            return True
                         elif response.status != 200:
                             logger.debug(f"Proxy API test failed: status {response.status}")
                             return False
@@ -458,9 +469,19 @@ class SteamMarketAPI:
             else:
                 logger.warning(f"  FAILED")
 
-        # Update proxy list to only working ones
-        self._proxy_list = working
-        logger.info(f"Working proxies: {len(working)}/{total}")
+        # Пустой список НИКОГДА не оставляем. Без прокси клиент молча уходит в
+        # Steam с адреса самого сервера: в логах это выглядит как «proxy: no proxy»
+        # и «Cannot rotate proxy: proxy list is empty», а на деле означает, что под
+        # раздачу 429 попадает IP сервера — тот самый, с которого логинятся аккаунты.
+        # Лучше работать через прокси, которые сейчас притормаживают, чем светить его.
+        if working:
+            self._proxy_list = working
+            logger.info(f"Working proxies: {len(working)}/{total}")
+        else:
+            logger.warning(
+                f"Ни одна из {total} прокси не прошла проверку — оставляем список как есть "
+                f"и работаем через них. Напрямую с IP сервера в Steam не идём."
+            )
 
         return working
 

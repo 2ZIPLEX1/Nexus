@@ -1421,6 +1421,22 @@ class SteamClientAio:
             logger.error(f"[{self.account_name}] Failed to get steamid: {e}")
             return None
 
+    async def is_session_alive(self) -> bool:
+        """
+        Реально ли жива сессия Steam (а не просто выставлен флаг после логина).
+
+        is_logged_in() отвечает по внутреннему флагу и остаётся True даже когда
+        куки протухли: тогда бот молча получает EResult.INVALID на балансе,
+        пустой ответ на access token и INVALID_PARAM при создании ордера.
+        """
+        if not self._client:
+            return False
+        try:
+            return bool(await self._client.is_session_alive())
+        except Exception as e:
+            logger.debug(f"[{self.account_name}] is_session_alive check failed: {e}")
+            return False
+
     async def get_access_token(self) -> Optional[str]:
         """
         Получить access token Steam для CSGO.TM ping-new.
@@ -1464,7 +1480,18 @@ class SteamClientAio:
                     )
                     return None
 
-                token = data.get('data', {}).get('webapi_token')
+                # Steam отдаёт "data" объектом только для живой сессии. На протухших
+                # куках приходит пустой список, и прежнее data.get('data', {}).get(...)
+                # падало с невнятным "'list' object has no attribute 'get'".
+                payload = data.get('data')
+                if not isinstance(payload, dict):
+                    logger.warning(
+                        f"[{self.account_name}] Access token: Steam вернул data={payload!r} "
+                        f"вместо объекта — сессия недействительна, нужен перелогин"
+                    )
+                    return None
+
+                token = payload.get('webapi_token')
 
                 if token:
                     logger.info(

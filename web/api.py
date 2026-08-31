@@ -604,6 +604,50 @@ async def scan_run(max_items: int = Query(10, ge=1, le=200), _=Depends(require_a
     return {"ok": True, "found": len(items)}
 
 
+@app.post("/api/orders/{order_id}/cancel")
+async def cancel_order(order_id: str, _=Depends(require_auth)):
+    """
+    Снять buy-ордер в Steam и пометить его отменённым в БД.
+
+    Панель раньше умела только показывать ордера, и снимать «фейковый профит»
+    приходилось командой /cancel в Telegram.
+    """
+    from src.database import TradesDatabase
+
+    db = TradesDatabase()
+    order = db.get_order_by_id(order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Ордер не найден")
+
+    account_name = order.get("account_name") or ""
+    account = None
+    manager = getattr(ctx.orch.account_service, "account_manager", None)
+    if manager:
+        account = manager.get_account(account_name) if account_name else None
+        if account is None:
+            for candidate in manager.get_all_accounts():
+                if getattr(candidate, "steam_client", None) and candidate.is_logged_in():
+                    account = candidate
+                    break
+
+    steam_client = getattr(account, "steam_client", None) if account else None
+    if not steam_client:
+        raise HTTPException(status_code=503, detail="Steam-клиент недоступен: аккаунт не залогинен")
+
+    try:
+        ok = await steam_client.cancel_buy_order(order_id)
+    except Exception as e:
+        logger.error("Не удалось отменить ордер %s: %s", order_id, e)
+        raise HTTPException(status_code=502, detail=f"Steam отклонил отмену: {e}")
+
+    if not ok:
+        raise HTTPException(status_code=502, detail="Steam не подтвердил отмену ордера")
+
+    db.update_order_status(order_id, "cancelled")
+    logger.info("Ордер %s (%s) отменён из панели", order_id, order.get("item_name"))
+    return {"ok": True, "order_id": order_id, "item_name": order.get("item_name")}
+
+
 @app.post("/api/command")
 async def command(body: CommandReq, _=Depends(require_auth)):
     """Команды из веб-экрана «Логи»: login / scan [N] / balances / guard <код>."""

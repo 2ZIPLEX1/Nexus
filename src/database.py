@@ -256,6 +256,25 @@ class TradesDatabase:
                 )
             """)
 
+            # Предметы, которые бот игнорирует в продажах: не выставляет на
+            # CSGO.TM, не репрайсит и не шлёт по ним уведомления о завышенной цене.
+            # Нужно для «висяков» — вещей, купленных сильно дороже нынешнего рынка:
+            # продать их без убытка нельзя, а уведомления они генерируют бесконечно.
+            #
+            # Ключ — market_hash_name, то есть скин вместе с износом:
+            # «AWP | Exothermic (Battle-Scarred)» замолкает, а
+            # «AWP | Exothermic (Field-Tested)» продолжает продаваться как обычно.
+            #
+            # На покупку НЕ влияет: там своя защита по профиту.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sale_ignored_items (
+                    market_hash_name TEXT PRIMARY KEY,
+                    reason TEXT,
+                    added_by TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
             # Create indexes for faster queries (will skip if already exist)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_purchased_account ON purchased_items(account_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_purchased_unlock ON purchased_items(unlock_date)")
@@ -1314,6 +1333,61 @@ class TradesDatabase:
                     LIMIT ?
                 """, (limit,))
 
+            return [dict(row) for row in cursor.fetchall()]
+
+    # ============ Sale Ignore Methods ============
+
+    def ignore_item_for_sale(self, market_hash_name: str, reason: str = "", added_by: str = "") -> bool:
+        """
+        Убрать предмет из продаж: бот перестанет его выставлять, репрайсить и
+        напоминать о нём в Telegram.
+
+        Игнорируется конкретный market_hash_name — скин вместе с износом.
+        Повторный вызов только обновляет причину, дублей не создаёт.
+        На покупку не влияет.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO sale_ignored_items (market_hash_name, reason, added_by)
+                VALUES (?, ?, ?)
+                ON CONFLICT(market_hash_name) DO UPDATE SET
+                    reason = excluded.reason,
+                    added_by = excluded.added_by
+            """, (market_hash_name, reason, added_by))
+            logger.info(f"Sale ignored: {market_hash_name} ({reason})")
+            return True
+
+    def unignore_item_for_sale(self, market_hash_name: str) -> bool:
+        """Вернуть предмет в продажи. True если он действительно был в списке."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM sale_ignored_items WHERE market_hash_name = ?",
+                (market_hash_name,)
+            )
+            removed = cursor.rowcount > 0
+            if removed:
+                logger.info(f"Sale ignore removed: {market_hash_name}")
+            return removed
+
+    def is_sale_ignored(self, market_hash_name: str) -> bool:
+        """Проверить, исключён ли предмет из продаж."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM sale_ignored_items WHERE market_hash_name = ? LIMIT 1",
+                (market_hash_name,)
+            )
+            return cursor.fetchone() is not None
+
+    def get_sale_ignored_items(self) -> list[dict]:
+        """Все предметы, исключённые из продаж. Новые сверху."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM sale_ignored_items ORDER BY created_at DESC"
+            )
             return [dict(row) for row in cursor.fetchall()]
 
     def mark_items_inactive(self, item_names: list[str]):

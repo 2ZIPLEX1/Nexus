@@ -47,6 +47,8 @@ export const api = {
   status: () => req("/api/status"),
   accounts: () => req("/api/accounts"),
   orders: () => req("/api/orders"),
+  cancelOrder: (orderId: string) =>
+    req(`/api/orders/${encodeURIComponent(orderId)}/cancel`, { method: "POST" }),
   inventory: () => req("/api/inventory"),
   profitable: () => req("/api/profitable"),
   sales: () => req("/api/sales"),

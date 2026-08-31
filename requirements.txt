@@ -3,6 +3,10 @@
 # steam[client]>=1.4.4  # OLD - replaced by aiosteampy
 aiosteampy[all]>=0.4.0  # NEW - Modern async Steam API wrapper (includes socks, converter)
 aiodns>=3.0.0  # aiohttp speedup
+# Нужен aiosteampy для логина (Steam шлёт protobuf-сообщения). В extras пакета
+# он НЕ объявлен: на Windows оказывался в venv попутно, а на чистом сервере
+# логин падал с "Protobuf library is required for Steam authentication".
+protobuf>=4.25.0
 # cchardet>=2.1.7  # aiohttp speedup - DISABLED (requires Visual Studio to compile)
 fake-useragent>=1.4.0  # Generate user-agents for sessions
 
@@ -37,6 +41,7 @@ aiohttp-socks>=0.8.0  # SOCKS proxy support for bottm
 asyncio-throttle>=1.0.2
 
 # Utils
+ijson>=3.2.0  # Потоковый разбор прайс-листа CSGO.TM (~220 МБ) — без него пик ~845 МБ
 pydantic>=2.5.0
 pydantic-settings>=2.1.0
 beautifulsoup4>=4.12.0  # HTML parsing

@@ -64,30 +64,26 @@ class Account:
     Wrapper для одного аккаунта с клиентами Steam и CSGO.TM.
     """
 
-    def __init__(self, config: AccountConfig, proxy_manager=None):
+    def __init__(self, config: AccountConfig):
         """
         Initialize account with config.
 
         Args:
             config: Account configuration
-            proxy_manager: Optional ProxyManager for rotating proxies
         """
         self.config = config
         self.name = config.name
-        self._proxy_manager = proxy_manager
 
-        # Determine proxy to use
+        # Прокси для логина берётся ТОЛЬКО из accounts.json.
+        # Пул proxies.txt — это прокси сканера, подмешивать их сюда нельзя:
+        # аккаунт должен ходить в Steam с одного постоянного адреса. Раньше
+        # пул подставлялся сюда как fallback, и логин уезжал на случайный
+        # сканерный прокси — при мёртвом пуле это роняло вход целиком.
         proxy_to_use = None
 
-        # Check if account has proxy configured
         if self.config.proxy and self.config.proxy.enabled and self.config.proxy.url:
             proxy_to_use = self.config.proxy.url
             logger.info(f"[{self.name}] Using account-specific proxy: {proxy_to_use.split('@')[-1]}")
-        # Otherwise, try to get from proxy_manager pool
-        elif proxy_manager:
-            proxy_to_use = proxy_manager.get_next_proxy()
-            if proxy_to_use:
-                logger.info(f"[{self.name}] Using proxy from pool: {proxy_to_use.split('@')[-1]}")
         else:
             logger.info(f"[{self.name}] No proxy configured, using direct connection")
 
@@ -127,12 +123,10 @@ class Account:
         event loop than where the Account was created (e.g., Flet GUI).
         This prevents "attached to a different loop" errors with aiohttp.
         """
-        # Determine proxy to use (same logic as __init__)
+        # Determine proxy to use (same logic as __init__): только accounts.json
         proxy_to_use = None
         if self.config.proxy and self.config.proxy.enabled and self.config.proxy.url:
             proxy_to_use = self.config.proxy.url
-        elif self._proxy_manager:
-            proxy_to_use = self._proxy_manager.get_next_proxy()
 
         # Get existing user agent
         user_agent = get_or_create_user_agent(self.name, data_dir="data")
@@ -708,7 +702,7 @@ class AccountManager:
                     total_budget=acc_data.get('limits', {}).get('total_budget', 5000.0),
                 )
 
-                account = Account(config, proxy_manager=self.proxy_manager)
+                account = Account(config)
                 self.accounts.append(account)
 
             logger.info(f"Loaded {len(self.accounts)} account(s)")

@@ -21,6 +21,12 @@ logger = get_logger(__name__)
 class ScannerService:
     """Service for managing auto-scanner in GUI."""
 
+    # Загрузка рынка = скачать ~7 МБ gzip через SOCKS-прокси, развернуть в ~220 МБ
+    # JSON, разобрать 366k записей и дотянуть словарь имён. Прежние 60 с покрывали
+    # это только на быстрой машине: на слабом VPS скан молча возвращал пустой
+    # список, и бот переставал находить позиции без единой ошибки наружу.
+    LOAD_DATA_TIMEOUT_SEC = 180.0
+
     def __init__(self, state: AppState, auto_buy_service=None):
         """Initialize scanner service."""
         self.state = state
@@ -166,11 +172,19 @@ class ScannerService:
             if proxy_list:
                 self.state.add_log(f"[INFO] Testing {len(proxy_list)} proxies...")
                 working_proxies = await self._test_proxies(proxy_list)
-                proxy_list = working_proxies
+                # Пустой результат НЕ обнуляет список. Иначе сканер уходит в Steam
+                # напрямую с IP сервера («proxy: no proxy», «Cannot rotate proxy:
+                # proxy list is empty»), ловит 429 уже на него и портит адрес,
+                # с которого логинятся аккаунты. Прокси, которые сейчас
+                # притормаживают, всё равно лучше прямого выхода.
                 if working_proxies:
+                    proxy_list = working_proxies
                     self.state.add_log(f"[SUCCESS] {len(working_proxies)} working proxies found")
                 else:
-                    self.state.add_log("[WARNING] No working proxies! Scan may fail")
+                    self.state.add_log(
+                        f"[WARNING] Ни одна из {len(proxy_list)} прокси не прошла проверку — "
+                        f"работаем через них же, напрямую в Steam не идём"
+                    )
 
             # Get first proxy or None
             first_proxy = proxy_list[0] if proxy_list else None
@@ -214,10 +228,13 @@ class ScannerService:
 
                 # Add timeout for load_data
                 try:
-                    await asyncio.wait_for(scanner.load_data(), timeout=60.0)
+                    await asyncio.wait_for(scanner.load_data(), timeout=self.LOAD_DATA_TIMEOUT_SEC)
                     self.state.add_log("[SUCCESS] Market data loaded")
                 except asyncio.TimeoutError:
-                    self.state.add_log("[ERROR] Timeout loading market data (60s)")
+                    self.state.add_log(
+                        f"[ERROR] Timeout loading market data "
+                        f"({self.LOAD_DATA_TIMEOUT_SEC:.0f}s)"
+                    )
                     return []
                 except Exception as e:
                     self.state.add_log(f"[ERROR] Failed to load market data: {e}")
@@ -385,7 +402,9 @@ class ScannerService:
                 self.state.add_log(f"[INFO] Testing proxy {idx}/{len(proxies)}: {proxy_display}")
 
                 api = SteamMarketAPI(proxy_url=proxy)
-                is_working = await api.check_proxy(proxy, timeout=10, check_steam_api=True)
+                # timeout=20: на 10 с SOCKS5-туннель до Steam через океан не всегда
+                # успевает, и живые прокси отсеивались как «Proxy timeout».
+                is_working = await api.check_proxy(proxy, timeout=20, check_steam_api=True)
                 await api.close()
 
                 if is_working:

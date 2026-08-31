@@ -250,6 +250,8 @@ class TelegramNotifier:
             "/cancel_all - Отменить все ордера\n\n"
             "<b>💰 TM Sales:</b>\n"
             "/prices - Завышенные цены\n"
+            "/ignored - Не продаём\n"
+            "/unignore [имя] - Вернуть в продажи\n"
             "/update_prices - Обновить до топ-1\n"
             "/sales_stats - Статистика продаж\n\n"
             "<b>⚙️ Настройки:</b>\n"
@@ -469,6 +471,35 @@ class TelegramNotifier:
         )
         await update.message.reply_text(message, parse_mode="HTML")
 
+    def _get_steam_client(self, account_name: str = ""):
+        """
+        Steam-клиент для операций с ордерами.
+
+        Раньше команды брали его только из self._trade_logic — это путь GUI.
+        В серверном режиме (server_runner/web.api) оркестратор кладёт сюда
+        sales_service, а trade_logic остаётся пустым, поэтому /cancel и
+        /cancel_all отвечали «Steam клиент не подключен» и ничего не делали.
+        """
+        svc = self._sales_service
+        if svc is not None:
+            acc_service = getattr(svc, "account_service", None)
+            manager = getattr(acc_service, "account_manager", None) if acc_service else None
+            if manager:
+                account = manager.get_account(account_name) if account_name else None
+                if account is None:
+                    # У ордера может не быть account_name — берём любой залогиненный.
+                    for candidate in manager.get_all_accounts():
+                        if getattr(candidate, "steam_client", None) and candidate.is_logged_in():
+                            account = candidate
+                            break
+                if account is not None and getattr(account, "steam_client", None):
+                    return account.steam_client
+
+        if self._trade_logic and getattr(self._trade_logic, "steam_client", None):
+            return self._trade_logic.steam_client
+
+        return None
+
     async def _cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /cancel command - отменить ордер по ID."""
         if not context.args:
@@ -507,9 +538,10 @@ class TelegramNotifier:
             return
 
         # Отменяем через Steam API
-        if self._trade_logic:
+        steam_client = self._get_steam_client(order.get('account_name', ''))
+        if steam_client:
             try:
-                success = await self._trade_logic.steam_client.cancel_buy_order(order_id)
+                success = await steam_client.cancel_buy_order(order_id)
                 if success:
                     # Обновляем статус в БД
                     trades_db.update_order_status(order_id, 'cancelled')
@@ -1010,6 +1042,69 @@ class TelegramNotifier:
 
     # ============ TM Sales Commands ============
 
+    async def _cmd_blacklist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /ignored - показать предметы, убранные из продаж."""
+        try:
+            from src.database import TradesDatabase
+            items = TradesDatabase().get_sale_ignored_items()
+
+            if not items:
+                await update.message.reply_text(
+                    "🔕 <b>Список пуст</b>\n\n"
+                    "Убрать предмет из продаж можно кнопкой «Больше не напоминать» "
+                    "в уведомлении о завышенных ценах.",
+                    parse_mode="HTML"
+                )
+                return
+
+            message = f"🔕 <b>Не продаём ({len(items)})</b>\n\n"
+            for idx, row in enumerate(items[:30], 1):
+                name = row['market_hash_name']
+                message += f"{idx}. <code>{name[:55]}</code>\n"
+                if row.get('reason'):
+                    message += f"   <i>{row['reason'][:60]}</i>\n"
+
+            if len(items) > 30:
+                message += f"\n... и ещё {len(items) - 30}\n"
+
+            message += "\n💡 Вернуть в продажи: <code>/unignore ТОЧНОЕ_ИМЯ</code>"
+
+            await update.message.reply_text(message, parse_mode="HTML")
+
+        except Exception as e:
+            logger.error(f"Error in /ignored: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Ошибка: {e}", parse_mode="HTML")
+
+    async def _cmd_unblacklist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /unignore <market_hash_name> - вернуть предмет в продажи."""
+        try:
+            name = " ".join(context.args).strip() if context.args else ""
+            if not name:
+                await update.message.reply_text(
+                    "Укажите предмет целиком:\n"
+                    "<code>/unignore AWP | Exothermic (Battle-Scarred)</code>\n\n"
+                    "Список — /ignored",
+                    parse_mode="HTML"
+                )
+                return
+
+            from src.database import TradesDatabase
+            if TradesDatabase().unignore_item_for_sale(name):
+                await update.message.reply_text(
+                    f"✅ <b>Снова продаём</b>\n\n<code>{name[:60]}</code>",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ В списке такого нет:\n<code>{name[:60]}</code>\n\n"
+                    "Имя должно совпадать точно — сверьтесь со списком /ignored",
+                    parse_mode="HTML"
+                )
+
+        except Exception as e:
+            logger.error(f"Error in /unignore: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Ошибка: {e}", parse_mode="HTML")
+
     async def _cmd_prices(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /prices command - показать завышенные цены."""
         if not self._sales_service:
@@ -1289,6 +1384,11 @@ class TelegramNotifier:
                 await self._handle_skip_item_callback(query, callback_data)
             elif callback_data.startswith("cancel_manual_update:"):
                 await self._handle_cancel_manual_update(query, callback_data)
+            # Sale-ignore callbacks («Больше не напоминать»)
+            elif callback_data.startswith("saleignore_choose:"):
+                await self._handle_saleignore_choose(query, callback_data)
+            elif callback_data.startswith("saleignore_do:"):
+                await self._handle_saleignore_do(query, callback_data)
             # Order check callbacks
             elif callback_data.startswith("cancel_unprofitable:"):
                 await self._handle_cancel_orders_callback(query, callback_data, 'unprofitable')
@@ -1481,6 +1581,119 @@ class TelegramNotifier:
 
         except Exception as e:
             logger.error(f"Error in enter_custom_price callback: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ <b>Ошибка</b>\n\n{str(e)}", parse_mode="HTML")
+
+    async def _handle_saleignore_choose(self, query, callback_data: str):
+        """Показать список предметов из уведомления — выбрать, какой убрать из продаж."""
+        try:
+            # Формат: saleignore_choose:items_key
+            parts = callback_data.split(":")
+            if len(parts) != 2:
+                await query.edit_message_text("❌ Неверный формат данных", parse_mode="HTML")
+                return
+
+            items_key = parts[1]
+
+            state = self._sales_service.state if self._sales_service else None
+            if not state or items_key not in getattr(state, '_pending_price_updates', {}):
+                await query.edit_message_text(
+                    "❌ <b>Данные устарели</b>\n\nУведомление слишком старое — дождитесь следующего.",
+                    parse_mode="HTML"
+                )
+                return
+
+            items = state._pending_price_updates[items_key]['items']
+
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+            # Telegram режет callback_data после 64 байт, поэтому передаём индекс,
+            # а не имя предмета: имена скинов легко перебирают лимит.
+            keyboard = []
+            for idx, item in enumerate(items[:10]):
+                name = item['market_hash_name']
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"🔕 {name[:45]}",
+                        callback_data=f"saleignore_do:{items_key}:{idx}"
+                    )
+                ])
+            keyboard.append([
+                InlineKeyboardButton("◀️ Отмена", callback_data=f"update_prices_cancel:none")
+            ])
+
+            message = (
+                "🔕 <b>Больше не напоминать</b>\n\n"
+                "Выберите предмет. Бот перестанет его выставлять на продажу, "
+                "менять ему цену и писать о нём.\n\n"
+                "Действует на этот вариант скина вместе с износом — "
+                "другие износы продолжат продаваться. На покупку не влияет."
+            )
+            if len(items) > 10:
+                message += f"\n\n<i>Показаны первые 10 из {len(items)}.</i>"
+
+            await query.edit_message_text(
+                message,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        except Exception as e:
+            logger.error(f"Error in saleignore_choose callback: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ <b>Ошибка</b>\n\n{str(e)}", parse_mode="HTML")
+
+    async def _handle_saleignore_do(self, query, callback_data: str):
+        """Убрать предмет из продаж: не выставлять, не репрайсить, не напоминать."""
+        try:
+            # Формат: saleignore_do:items_key:item_index
+            parts = callback_data.split(":")
+            if len(parts) != 3:
+                await query.edit_message_text("❌ Неверный формат данных", parse_mode="HTML")
+                return
+
+            items_key = parts[1]
+            item_index = int(parts[2])
+
+            state = self._sales_service.state if self._sales_service else None
+            if not state or items_key not in getattr(state, '_pending_price_updates', {}):
+                await query.edit_message_text("❌ <b>Данные устарели</b>", parse_mode="HTML")
+                return
+
+            data = state._pending_price_updates[items_key]
+            items = data['items']
+            account_name = data['account_name']
+
+            if item_index >= len(items):
+                await query.edit_message_text("❌ Предмет не найден", parse_mode="HTML")
+                return
+
+            item = items[item_index]
+            market_hash_name = item['market_hash_name']
+
+            from src.database import TradesDatabase
+            db = TradesDatabase()
+
+            db.ignore_item_for_sale(
+                market_hash_name,
+                reason=f"куплен {item.get('purchase_price', 0):.0f}₽, "
+                       f"рынок {item.get('market_min_price', 0):.0f}₽",
+                added_by=f"telegram/{account_name}"
+            )
+
+            # Лот, уже стоящий на CSGO.TM, намеренно не снимаем: вдруг его всё-таки
+            # купят по текущей цене. Мы лишь перестаём его трогать и напоминать.
+            await query.edit_message_text(
+                f"🔕 <b>Убран из продаж</b>\n\n"
+                f"<b>{market_hash_name[:50]}</b>\n\n"
+                f"Бот больше не будет его выставлять, менять ему цену "
+                f"и писать о нём.\n\n"
+                f"Текущий лот на CSGO.TM, если он есть, остаётся висеть — "
+                f"снимите его вручную, если нужно.\n\n"
+                f"Список — /ignored, вернуть в продажи — /unignore",
+                parse_mode="HTML"
+            )
+
+        except Exception as e:
+            logger.error(f"Error in saleignore_do callback: {e}", exc_info=True)
             await query.edit_message_text(f"❌ <b>Ошибка</b>\n\n{str(e)}", parse_mode="HTML")
 
     async def _handle_skip_item_callback(self, query, callback_data: str):
@@ -1983,17 +2196,10 @@ class TelegramNotifier:
                 account = order.get('account')
 
                 try:
-                    # Получаем аккаунт и отменяем ордер
-                    if self._trade_logic:
-                        success = await self._trade_logic.steam_client.cancel_buy_order(order_id)
-                    elif self._sales_service:
-                        acc_state = self._sales_service._account_states.get(account)
-                        if acc_state and hasattr(acc_state, 'steam_client'):
-                            success = await acc_state.steam_client.cancel_buy_order(order_id)
-                        else:
-                            success = False
-                    else:
-                        success = False
+                    # _account_states хранит только csgotm_client; steam_client живёт
+                    # в Account из account_manager, поэтому идём через общий хелпер.
+                    steam_client = self._get_steam_client(account or "")
+                    success = bool(steam_client) and await steam_client.cancel_buy_order(order_id)
 
                     if success:
                         # Обновляем статус в БД
@@ -2041,13 +2247,8 @@ class TelegramNotifier:
                 account = order.get('account_name', 'default')
 
                 try:
-                    success = False
-                    if self._trade_logic:
-                        success = await self._trade_logic.steam_client.cancel_buy_order(order_id)
-                    elif self._sales_service:
-                        acc_state = self._sales_service._account_states.get(account)
-                        if acc_state and hasattr(acc_state, 'steam_client'):
-                            success = await acc_state.steam_client.cancel_buy_order(order_id)
+                    steam_client = self._get_steam_client(account or "")
+                    success = bool(steam_client) and await steam_client.cancel_buy_order(order_id)
 
                     if success:
                         db.update_order_status(order_id, 'cancelled')
@@ -2117,6 +2318,8 @@ class TelegramNotifier:
         self._app.add_handler(CommandHandler("set_max_price", self._cmd_set_max_price))
 
         # TM Sales commands
+        self._app.add_handler(CommandHandler("ignored", self._cmd_blacklist))
+        self._app.add_handler(CommandHandler("unignore", self._cmd_unblacklist))
         self._app.add_handler(CommandHandler("prices", self._cmd_prices))
         self._app.add_handler(CommandHandler("update_prices", self._cmd_update_prices))
         self._app.add_handler(CommandHandler("sales_stats", self._cmd_sales_stats))

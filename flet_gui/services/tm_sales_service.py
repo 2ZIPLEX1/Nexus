@@ -358,6 +358,28 @@ class TmSalesService:
             # Получаем access token
             token = await account.steam_client.get_access_token()
 
+            # Пусто = почти всегда протухшая сессия. is_logged_in() при этом врёт:
+            # флаг стоит с момента старта, а куки давно недействительны. Без этой
+            # ветки бот бесконечно ловил invalid_access_token, продажи стояли,
+            # и починить это можно было только перезапуском службы.
+            if not token:
+                alive = False
+                try:
+                    alive = await account.steam_client.is_session_alive()
+                except Exception as e:
+                    logger.warning(f"[{account_name}] Session check failed: {e}")
+
+                if not alive:
+                    self.state.add_log(
+                        f"[WARNING] [{account_name}] Сессия Steam протухла — перелогиниваюсь"
+                    )
+                    account.reinitialize_steam_client()
+                    if await account.login_async():
+                        self.state.add_log(f"[SUCCESS] [{account_name}] Перелогин выполнен")
+                        token = await account.steam_client.get_access_token()
+                    else:
+                        raise Exception("перелогин не удался")
+
             if token:
                 acc_state.access_token = token
                 acc_state.token_expires_at = datetime.now() + timedelta(hours=23)
@@ -599,6 +621,19 @@ class TmSalesService:
             expected_price = item.get('expected_sell_price', 0)
             market_hash_name = item.get('market_hash_name', '')
             item_id = item.get('id')
+
+            # Предмет убран из продаж вручную — не выставляем. Иначе он вернулся бы
+            # на витрину следующим же циклом, и уведомления пошли бы заново.
+            if market_hash_name:
+                try:
+                    from src.database import TradesDatabase
+                    if TradesDatabase().is_sale_ignored(market_hash_name):
+                        self.state.add_log(
+                            f"[INFO] [{account_name}] Убран из продаж, не выставляю: {market_hash_name[:40]}"
+                        )
+                        return
+                except Exception as e:
+                    logger.warning(f"[{account_name}] Sale-ignore check failed: {e}")
 
             if not expected_price:
                 logger.warning(f"[{account_name}] Cannot list item - missing expected_sell_price: {market_hash_name}")
@@ -1433,12 +1468,28 @@ class TmSalesService:
 
             overpriced_items = []
 
+            # Предметы, убранные из продаж кнопкой «Больше не напоминать».
+            # Читаем один раз на проверку: это «висяки», по которым уведомление
+            # приходило бы каждый цикл и ничего бы не меняло.
+            try:
+                from src.database import TradesDatabase
+                sale_ignored = {
+                    row['market_hash_name'] for row in TradesDatabase().get_sale_ignored_items()
+                }
+            except Exception as e:
+                logger.warning(f"[{account_name}] Failed to load sale-ignore list: {e}")
+                sale_ignored = set()
+
             for our_item in listed_items:
                 market_hash_name = our_item.get('market_hash_name')
                 tm_item_id = our_item.get('tm_item_id')  # ID предмета в CSGO.TM
                 db_item_id = our_item.get('id')
 
                 if not market_hash_name or not tm_item_id:
+                    continue
+
+                if market_hash_name in sale_ignored:
+                    logger.debug(f"[{account_name}] Sale ignored, skipping: {market_hash_name}")
                     continue
 
                 # Получаем текущую цену нашего лота
@@ -1616,6 +1667,12 @@ class TmSalesService:
                             InlineKeyboardButton(
                                 "✏️ Ввести цену вручную",
                                 callback_data=f"update_prices_manual:{items_key}"
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                "🔕 Больше не напоминать",
+                                callback_data=f"saleignore_choose:{items_key}"
                             )
                         ],
                         [

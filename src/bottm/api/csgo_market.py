@@ -13,6 +13,7 @@ from typing import Optional
 from enum import Enum
 
 import aiohttp
+import ijson
 
 from src.bottm.config import Currency, config
 
@@ -250,19 +251,26 @@ class CSGOMarketAPI:
                     logger.error(f"Failed to load prices: {response.status}")
                     return {}
 
-                response_data = await response.json()
-
-                if not response_data.get("success"):
-                    logger.error("Prices API returned success=false")
-                    return {}
-
-                items = response_data.get("items", {})
+                # Ответ этого эндпоинта — ~220 МБ JSON, и он растёт (366k записей
+                # против 334k часом раньше). `await response.json()` держал его в
+                # памяти сразу в трёх видах (bytes → str → dict): пик 845 МБ, причём
+                # на КАЖДОМ скане — ItemScanner пересоздаётся, и кэш каждый раз пуст.
+                # На VPS с 1-2 ГБ это гарантированный OOM.
+                #
+                # Записи нужны строго по одной и только ради четырёх полей, поэтому
+                # разбираем потоком: пик равен размеру `aggregated` (~27k имён) — 18 МБ.
+                # Результат при этом побайтово тот же, что давал json.loads.
+                #
+                # Проверки `success` тут намеренно нет: она требовала распарсенного
+                # ответа целиком. Ошибку ловим ниже по пустому результату.
 
                 # Same item can have multiple class_instances (different stickers, floats)
                 # We need to aggregate: take lowest price, highest buy_order, sum popularity
                 aggregated: dict[str, dict] = {}
+                total_listings = 0
 
-                for class_instance, item_data in items.items():
+                async for class_instance, item_data in ijson.kvitems_async(response.content, "items"):
+                    total_listings += 1
                     try:
                         market_hash_name = item_data.get("market_hash_name", "")
                         if not market_hash_name:
@@ -302,6 +310,16 @@ class CSGOMarketAPI:
                         logger.debug(f"Skipping item {class_instance}: {e}")
                         continue
 
+                # Пустой ответ = success:false, битый JSON или обрыв соединения.
+                # Кэш при этом не трогаем: лучше отработать на прошлых ценах,
+                # чем обнулить их и уйти торговать по пустому прайсу.
+                if not aggregated:
+                    logger.error(
+                        f"Prices API returned no usable items "
+                        f"(listings seen: {total_listings}) — cache left untouched"
+                    )
+                    return self._prices_cache
+
                 # Convert aggregated data to ItemMarketPrice
                 for market_hash_name, agg in aggregated.items():
                     self._prices_cache[market_hash_name] = ItemMarketPrice(
@@ -313,7 +331,7 @@ class CSGOMarketAPI:
                         popularity_7d=agg["total_popularity"],
                     )
 
-                logger.info(f"Loaded {len(self._prices_cache)} unique items from {len(items)} listings")
+                logger.info(f"Loaded {len(self._prices_cache)} unique items from {total_listings} listings")
                 return self._prices_cache
 
         except Exception as e:

@@ -44,9 +44,13 @@ RestrictRealtime=true
 RestrictNamespaces=true
 LockPersonality=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources @obsolete
+# seccomp-фильтра здесь НЕТ намеренно. Node/V8 умирает под ним сразу после
+# старта: SIGSYS, `status=31/SYS`, core-dump и бесконечный цикл рестартов.
+# Ни @system-service, ни он же без @resources процесс не спасают.
+# Потеря невелика: фронтенд не держит секретов, отдаёт статику и ходит только
+# к API на localhost. Остальная изоляция (ProtectSystem=strict, ProtectHome,
+# NoNewPrivileges, PrivateTmp, UMask) остаётся в силе.
+# Для tm-steambot-web.service фильтр сохранён — Python под ним работает.
 
 # Next.js пишет кеш в .next во время работы
 ReadWritePaths=/opt/tm-steambot/web/frontend/.next
