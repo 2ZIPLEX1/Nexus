@@ -1,0 +1,134 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Точные тёмные токены uxera */
+    --background: 0 0% 1%;            /* #030303 */
+    --foreground: 0 0% 100%;
+    --border: 220 13% 13%;
+    --input: 220 13% 13%;
+    --ring: 330 81% 60%;
+
+    --primary: 330 81% 60%;          /* розовый */
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 12% 9%;
+    --secondary-foreground: 0 0% 100%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --muted: 220 12% 9%;
+    --muted-foreground: 210 15% 52%;
+
+    --accent: 220 12% 9%;
+    --accent-foreground: 0 0% 100%;
+
+    --popover: 220 14% 5%;
+    --popover-foreground: 0 0% 100%;
+
+    --card: 220 14% 5%;
+    --card-foreground: 0 0% 100%;
+
+    --uxera-accent: #A855F7;
+    --uxera-accent-dark: #7C3AED;
+    --uxera-accent-rgb: 168 85 247;
+    --success-rgb: 52 199 123;
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer components {
+  /* Тёмные стеклянные панели uxera */
+  .uxera-glass-panel,
+  .glass {
+    border: 1px solid rgba(255, 255, 255, 0.065);
+    background:
+      linear-gradient(145deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.018) 42%, rgba(0, 0, 0, 0.18)),
+      rgba(4, 2, 8, 0.56);
+    box-shadow:
+      0 8px 40px rgba(0, 0, 0, 0.46),
+      inset 1px 1px 0 rgba(255, 255, 255, 0.055),
+      inset -1px -1px 0 rgba(255, 255, 255, 0.028);
+    backdrop-filter: blur(9px);
+    -webkit-backdrop-filter: blur(9px);
+    border-radius: var(--radius);
+  }
+
+  .uxera-glass-soft {
+    border: 1px solid rgba(255, 255, 255, 0.055);
+    background: rgba(6, 7, 11, 0.48);
+    box-shadow:
+      inset 1px 1px 0 rgba(255, 255, 255, 0.045),
+      inset -1px -1px 0 rgba(255, 255, 255, 0.024);
+    backdrop-filter: blur(7px);
+    -webkit-backdrop-filter: blur(7px);
+    border-radius: var(--radius);
+  }
+
+  .uxera-glass-field {
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    background: rgba(6, 7, 11, 0.52);
+    box-shadow: inset 1px 1px 0 rgba(255, 255, 255, 0.025);
+  }
+
+  /* Белая кнопка uxera */
+  .uxera-btn-white {
+    background: #ffffff;
+    color: #0a0a0a;
+    border: 1px solid rgba(255, 255, 255, 0.9);
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.6);
+    transition: background 160ms ease, transform 120ms ease, opacity 160ms ease;
+  }
+  .uxera-btn-white:hover { background: rgba(255, 255, 255, 0.88); }
+  .uxera-btn-white:active { transform: scale(0.985); }
+  .uxera-btn-white:disabled { opacity: 0.45; }
+
+  /* Прозрачная стеклянная кнопка uxera (вторичная) */
+  .uxera-glass-button {
+    border: 1px solid rgba(255, 255, 255, 0.075);
+    background: rgba(255, 255, 255, 0.035);
+    color: #fff;
+    box-shadow:
+      inset 1px 1px 0 rgba(255, 255, 255, 0.045),
+      inset -1px -1px 0 rgba(255, 255, 255, 0.022);
+    transition: border-color 160ms ease, background 160ms ease, color 160ms ease, opacity 160ms ease;
+  }
+  .uxera-glass-button:hover {
+    border-color: rgba(255, 255, 255, 0.13);
+    background: rgba(255, 255, 255, 0.075);
+  }
+  .uxera-glass-button:disabled { opacity: 0.4; }
+}
+
+@layer base {
+  * { @apply border-border; }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-geist-sans), -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+    background:
+      radial-gradient(1100px 560px at 85% -12%, rgb(var(--uxera-accent-rgb) / 0.07), transparent 60%),
+      hsl(var(--background));
+    background-attachment: fixed;
+  }
+}
+
+/* Скроллбары uxera */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--border)); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--uxera-accent); }
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.animate-shimmer { animation: shimmer 2s infinite; }

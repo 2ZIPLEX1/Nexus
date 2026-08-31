@@ -14,6 +14,7 @@ import threading
 import time
 import subprocess
 import os
+import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -26,7 +27,6 @@ from src.account_manager import AccountManager
 from src.trading_bot import TradingBot
 from src.database import trades_db
 from src.currency_converter import currency_converter
-from src.auto_buyer import AutoBuyer
 from src.auto_scanner import AutoScanner
 from src.proxy_manager import ProxyManager
 from src.statistics import TradingStatistics
@@ -35,7 +35,22 @@ logger = get_logger(__name__)
 
 # Настройки темы
 ctk.set_appearance_mode("dark")
-ctk.set_default_color_theme("blue")
+ctk.set_default_color_theme("dark-blue")
+
+# Современная цветовая палитра
+COLORS = {
+    "bg_primary": "#1a1a1a",      # Основной фон
+    "bg_secondary": "#242424",    # Вторичный фон
+    "bg_tertiary": "#2d2d2d",     # Третичный фон (карточки)
+    "accent_green": "#10b981",    # Зеленый акцент (успех)
+    "accent_red": "#ef4444",      # Красный акцент (ошибка)
+    "accent_blue": "#3b82f6",     # Синий акцент (инфо)
+    "accent_yellow": "#f59e0b",   # Желтый акцент (предупреждение)
+    "accent_purple": "#8b5cf6",   # Фиолетовый акцент
+    "text_primary": "#ffffff",    # Основной текст
+    "text_secondary": "#9ca3af",  # Вторичный текст
+    "border": "#3f3f46",          # Границы
+}
 
 
 class TradingBotGUI(ctk.CTk):
@@ -66,10 +81,14 @@ class TradingBotGUI(ctk.CTk):
         self.sort_by_profit = False  # False = по умолчанию (по дате), True = по профиту
 
         # Новые модули
-        self.auto_buyer: Optional[AutoBuyer] = None
         self.auto_scanner: Optional[AutoScanner] = None
         self.proxy_manager: Optional[ProxyManager] = None
         self.statistics: Optional[TradingStatistics] = None
+
+        # AsyncRunner для работы с async Steam API
+        from src.async_helper import get_async_runner
+        self.async_runner = get_async_runner()
+        logger.info("AsyncRunner initialized for GUI")
 
         # Настройки бота (загружаются из bot_config.json)
         self.bot_config = {
@@ -92,15 +111,11 @@ class TradingBotGUI(ctk.CTk):
             'scanner_max_items': 10,  # Reduced to avoid rate limits
             'scanner_delay': 7.0,  # Increased delay to avoid 429 errors
             'scanner_workers': 1,  # Reduced workers to avoid overwhelming proxies
-            # Auto Buyer настройки
-            'auto_buy_enabled': False,
-            'auto_buy_max_items': 10,
-            'auto_buy_max_price': 1000.0,
-            'auto_buy_total_budget': 5000.0,
-            'auto_buy_min_profit': 15.0,
             # Auto Scanner настройки
             'auto_scan_enabled': False,
-            'auto_scan_interval': 30,  # минуты
+            'auto_scan_interval': 30,  # минуты - интервал поиска новых
+            'auto_scan_new_items': 10,  # количество новых предметов за раз
+            'auto_rescan_interval': 60,  # минуты - интервал проверки актуальности
             # Proxy Manager настройки
             'proxy_max_requests': 15,
             'proxy_cooldown': 60,  # секунды
@@ -154,16 +169,35 @@ class TradingBotGUI(ctk.CTk):
 
     def _create_header(self):
         """Создать верхнюю панель."""
-        header_frame = ctk.CTkFrame(self, height=60)
+        header_frame = ctk.CTkFrame(
+            self,
+            height=80,
+            fg_color=COLORS["bg_secondary"],
+            corner_radius=15
+        )
         header_frame.pack(fill="x", padx=10, pady=10)
+
+        # Левая часть - заголовок и статус
+        left_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
+        left_frame.pack(side="left", padx=20, pady=15)
 
         # Заголовок
         title_label = ctk.CTkLabel(
-            header_frame,
+            left_frame,
             text="🤖 Steam Trading Bot",
-            font=ctk.CTkFont(size=24, weight="bold")
+            font=ctk.CTkFont(size=26, weight="bold"),
+            text_color=COLORS["text_primary"]
         )
-        title_label.pack(side="left", padx=20)
+        title_label.pack(anchor="w")
+
+        # Статус и время работы
+        self.status_label = ctk.CTkLabel(
+            left_frame,
+            text="⏸️ Бот остановлен",
+            font=ctk.CTkFont(size=12),
+            text_color=COLORS["text_secondary"]
+        )
+        self.status_label.pack(anchor="w", pady=(5, 0))
 
         # Кнопки управления
         btn_frame = ctk.CTkFrame(header_frame, fg_color="transparent")
@@ -173,8 +207,8 @@ class TradingBotGUI(ctk.CTk):
             btn_frame,
             text="▶️ Старт",
             command=self._start_bot,
-            fg_color="green",
-            hover_color="darkgreen",
+            fg_color=COLORS["accent_green"],
+            hover_color="#059669",
             width=130,
             height=45,
             font=ctk.CTkFont(size=14, weight="bold")
@@ -185,8 +219,8 @@ class TradingBotGUI(ctk.CTk):
             btn_frame,
             text="⏸️ Стоп",
             command=self._stop_bot,
-            fg_color="red",
-            hover_color="darkred",
+            fg_color=COLORS["accent_red"],
+            hover_color="#dc2626",
             width=130,
             height=45,
             font=ctk.CTkFont(size=14, weight="bold"),
@@ -198,6 +232,8 @@ class TradingBotGUI(ctk.CTk):
             btn_frame,
             text="🔄 Обновить",
             command=self._refresh_data,
+            fg_color=COLORS["accent_blue"],
+            hover_color="#2563eb",
             width=130,
             height=45,
             font=ctk.CTkFont(size=14, weight="bold")
@@ -205,14 +241,47 @@ class TradingBotGUI(ctk.CTk):
         self.btn_refresh.pack(side="left", padx=5)
 
     def _create_dashboard_tab(self):
-        """Создать вкладку Dashboard."""
-        # Верхняя панель со статистикой
-        stats_frame = ctk.CTkFrame(self.tab_dashboard)
-        stats_frame.pack(fill="x", padx=10, pady=10)
+        """Создать вкладку Dashboard с 3 панелями."""
+        # Top panel - 40% высоты (статистика с выбором аккаунта)
+        top_panel = ctk.CTkFrame(
+            self.tab_dashboard,
+            corner_radius=10,
+            fg_color="#2B2D35",
+            border_width=1,
+            border_color="#3A3D45"
+        )
+        top_panel.pack(fill="both", expand=False, padx=10, pady=10)
 
-        # Карточки статистики
+        # Account selector в top panel
+        account_selector_frame = ctk.CTkFrame(top_panel, fg_color="transparent")
+        account_selector_frame.pack(fill="x", padx=20, pady=(15, 10))
+
+        ctk.CTkLabel(
+            account_selector_frame,
+            text="Показать метрики для:",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=(0, 10))
+
+        # Получаем список аккаунтов
+        account_names = ["Все аккаунты"]
+        if self.account_manager and len(self.account_manager.accounts) > 0:
+            account_names.extend([acc.name for acc in self.account_manager.accounts])
+
+        self.account_selector = ctk.CTkComboBox(
+            account_selector_frame,
+            values=account_names,
+            command=self._on_account_selected,
+            width=200,
+            corner_radius=8
+        )
+        self.account_selector.set("Все аккаунты")
+        self.account_selector.pack(side="left")
+
+        # Карточки статистики в top panel
+        stats_cards_frame = ctk.CTkFrame(top_panel, fg_color="transparent")
+        stats_cards_frame.pack(fill="x", padx=15, pady=(10, 15))
+
         self.stats_cards = {}
-
         stats_data = [
             ("💰 Баланс Steam", "0.00 RUB", "balance_steam"),
             ("💎 Баланс CSGO.TM", "0.00 RUB", "balance_csgotm"),
@@ -223,51 +292,549 @@ class TradingBotGUI(ctk.CTk):
         ]
 
         for i, (title, value, key) in enumerate(stats_data):
-            card = self._create_stat_card(stats_frame, title, value)
+            card = self._create_stat_card(stats_cards_frame, title, value, key)
             card.grid(row=i//3, column=i%3, padx=10, pady=10, sticky="ew")
             self.stats_cards[key] = card
 
-        stats_frame.grid_columnconfigure(0, weight=1)
-        stats_frame.grid_columnconfigure(1, weight=1)
-        stats_frame.grid_columnconfigure(2, weight=1)
+        stats_cards_frame.grid_columnconfigure(0, weight=1)
+        stats_cards_frame.grid_columnconfigure(1, weight=1)
+        stats_cards_frame.grid_columnconfigure(2, weight=1)
 
-        # Таблица последних сделок
-        trades_frame = ctk.CTkFrame(self.tab_dashboard)
-        trades_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # Bottom container - 60% высоты
+        bottom_container = ctk.CTkFrame(self.tab_dashboard, fg_color="transparent")
+        bottom_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        trades_label = ctk.CTkLabel(
-            trades_frame,
-            text="📈 Последние сделки",
-            font=ctk.CTkFont(size=16, weight="bold")
+        # Configure grid weights (50/50 split)
+        bottom_container.grid_columnconfigure(0, weight=1)
+        bottom_container.grid_columnconfigure(1, weight=1)
+        bottom_container.grid_rowconfigure(0, weight=1)
+
+        # Left panel - Последние сделки
+        bottom_left = ctk.CTkFrame(
+            bottom_container,
+            corner_radius=10,
+            fg_color="#2B2D35",
+            border_width=1,
+            border_color="#3A3D45"
         )
-        trades_label.pack(padx=10, pady=10, anchor="w")
+        bottom_left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self._create_recent_trades_table(bottom_left)
 
-        # Скроллируемый фрейм для таблицы
-        self.trades_scrollable = ctk.CTkScrollableFrame(trades_frame, height=200)
-        self.trades_scrollable.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # Right panel - Активные ордера
+        bottom_right = ctk.CTkFrame(
+            bottom_container,
+            corner_radius=10,
+            fg_color="#2B2D35",
+            border_width=1,
+            border_color="#3A3D45"
+        )
+        bottom_right.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        self._create_active_orders_table(bottom_right)
 
-    def _create_stat_card(self, parent, title: str, value: str):
-        """Создать карточку статистики."""
-        card_frame = ctk.CTkFrame(parent)
+    def _create_stat_card(self, parent, title: str, value: str, key: str):
+        """
+        Создать карточку со статистикой (улучшенный дизайн).
+
+        Args:
+            parent: Родительский контейнер
+            title: Заголовок карточки
+            value: Значение
+            key: Ключ для идентификации карточки
+        """
+        card_frame = ctk.CTkFrame(
+            parent,
+            corner_radius=12,
+            border_width=1,
+            border_color=COLORS["border"],
+            fg_color=COLORS["bg_tertiary"]
+        )
 
         title_label = ctk.CTkLabel(
             card_frame,
             text=title,
-            font=ctk.CTkFont(size=14)
+            font=ctk.CTkFont(size=13),
+            text_color=COLORS["text_secondary"]
         )
-        title_label.pack(padx=15, pady=(15, 5))
+        title_label.pack(padx=15, pady=(15, 5), anchor="w")
 
         value_label = ctk.CTkLabel(
             card_frame,
             text=value,
-            font=ctk.CTkFont(size=24, weight="bold")
+            font=ctk.CTkFont(size=26, weight="bold"),
+            text_color=COLORS["text_primary"]
         )
-        value_label.pack(padx=15, pady=(5, 15))
+        value_label.pack(padx=15, pady=(0, 15), anchor="w")
 
         # Сохраняем ссылку на label для обновления
         card_frame.value_label = value_label
 
         return card_frame
+
+    def _on_account_selected(self, account_name: str):
+        """Callback при выборе аккаунта из dropdown."""
+        self._update_dashboard_stats(account_name)
+        self._refresh_recent_trades()
+        self._refresh_active_orders_table()
+
+    def _format_price_with_conversion(self, price_rub: float, show_conversion: bool = True) -> str:
+        """
+        Форматирует цену с конвертацией в валюту аккаунта.
+
+        Args:
+            price_rub: Цена в рублях
+            show_conversion: Показывать ли конвертацию
+
+        Returns:
+            Строка: "1000.00 ₽" или "1000.00 ₽ (~10.50 EUR)"
+        """
+        if not show_conversion or price_rub == 0:
+            return f"{price_rub:.2f} ₽"
+
+        # Получить валюту первого активного аккаунта
+        account_currency = 'RUB'
+        if self.account_manager and len(self.account_manager.accounts) > 0:
+            account = self.account_manager.accounts[0]
+            account_currency = getattr(account.config, 'currency', 'RUB')
+
+        # Если аккаунт в RUB - не показывать конвертацию
+        if account_currency == 'RUB':
+            return f"{price_rub:.2f} ₽"
+
+        # Конвертировать через currency_rates
+        try:
+            from src.currency_rates import convert_rub_to_currency
+
+            # Получить код валюты Steam (EUR = 3, USD = 1, RUB = 5)
+            currency_codes = {'EUR': 3, 'USD': 1, 'RUB': 5}
+            currency_code = currency_codes.get(account_currency, 5)
+
+            converted = convert_rub_to_currency(price_rub, currency_code)
+            return f"{price_rub:.2f} ₽ (~{converted:.2f} {account_currency})"
+        except Exception as e:
+            logger.warning(f"Failed to convert currency: {e}")
+            return f"{price_rub:.2f} ₽"
+
+    def _create_recent_trades_table(self, parent_frame):
+        """Создать таблицу последних сделок."""
+        # Header
+        header_frame = ctk.CTkFrame(parent_frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=15, pady=(15, 10))
+
+        ctk.CTkLabel(
+            header_frame,
+            text="📈 Последние сделки",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(side="left")
+
+        # Scrollable container
+        self.trades_scrollable = ctk.CTkScrollableFrame(
+            parent_frame,
+            fg_color="transparent"
+        )
+        self.trades_scrollable.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Заголовок таблицы
+        header = ctk.CTkFrame(self.trades_scrollable, fg_color=COLORS["bg_tertiary"], corner_radius=6)
+        header.pack(fill="x", pady=(0, 5))
+
+        headers = ["Дата", "Предмет", "Покупка", "Продажа", "Профит"]
+        widths = [140, 0, 90, 90, 90]  # 0 = expand для предмета
+
+        header_container = ctk.CTkFrame(header, fg_color="transparent")
+        header_container.pack(fill="x", padx=10, pady=6)
+
+        for i, (text, width) in enumerate(zip(headers, widths)):
+            if width == 0:
+                # Расширяемая колонка для названия предмета
+                label = ctk.CTkLabel(
+                    header_container,
+                    text=text,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    anchor="w"
+                )
+                label.pack(side="left", fill="x", expand=True, padx=5)
+            else:
+                label = ctk.CTkLabel(
+                    header_container,
+                    text=text,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    width=width,
+                    anchor="e" if i >= 2 else "w"
+                )
+                label.pack(side="left", padx=5)
+
+    def _create_active_orders_table(self, parent_frame):
+        """Создать таблицу активных ордеров."""
+        # Header
+        header_frame = ctk.CTkFrame(parent_frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=15, pady=(15, 10))
+
+        ctk.CTkLabel(
+            header_frame,
+            text="📋 Активные ордера",
+            font=ctk.CTkFont(size=16, weight="bold")
+        ).pack(side="left")
+
+        # Scrollable container
+        self.orders_scrollable = ctk.CTkScrollableFrame(
+            parent_frame,
+            fg_color="transparent"
+        )
+        self.orders_scrollable.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Заголовок таблицы
+        header = ctk.CTkFrame(self.orders_scrollable, fg_color=COLORS["bg_tertiary"], corner_radius=6)
+        header.pack(fill="x", pady=(0, 5))
+
+        headers = ["Аккаунт", "Предмет", "Цена", "Создан"]
+        widths = [120, 0, 90, 140]  # 0 = expand для предмета
+
+        header_container = ctk.CTkFrame(header, fg_color="transparent")
+        header_container.pack(fill="x", padx=10, pady=6)
+
+        for i, (text, width) in enumerate(zip(headers, widths)):
+            if width == 0:
+                # Расширяемая колонка для названия предмета
+                label = ctk.CTkLabel(
+                    header_container,
+                    text=text,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    anchor="w"
+                )
+                label.pack(side="left", fill="x", expand=True, padx=5)
+            else:
+                label = ctk.CTkLabel(
+                    header_container,
+                    text=text,
+                    font=ctk.CTkFont(size=11, weight="bold"),
+                    width=width,
+                    anchor="e" if i >= 2 else "w"
+                )
+                label.pack(side="left", padx=5)
+
+    def _refresh_recent_trades(self):
+        """Обновить таблицу последних сделок."""
+        if not hasattr(self, 'trades_scrollable'):
+            return
+
+        # Очистить старые строки (кроме заголовка)
+        for widget in self.trades_scrollable.winfo_children()[1:]:
+            widget.destroy()
+
+        try:
+            # Получить данные из БД
+            recent_trades = trades_db.get_recent_sales(limit=10)
+
+            # Фильтр по аккаунту если выбран конкретный
+            selected_account = self.account_selector.get() if hasattr(self, 'account_selector') else "Все аккаунты"
+            if selected_account != "Все аккаунты":
+                recent_trades = [t for t in recent_trades if t.get('account_name') == selected_account]
+
+            for trade in recent_trades:
+                row_frame = ctk.CTkFrame(self.trades_scrollable, fg_color=COLORS["bg_tertiary"], corner_radius=4)
+                row_frame.pack(fill="x", pady=2)
+
+                row_container = ctk.CTkFrame(row_frame, fg_color="transparent")
+                row_container.pack(fill="x", padx=10, pady=6)
+
+                # Данные строки
+                date = trade.get('sale_date', 'N/A')
+                if date and len(date) > 16:
+                    date = date[:16]  # Обрезаем до "YYYY-MM-DD HH:MM"
+                elif date and len(date) > 10:
+                    date = date[:10]  # Только дата
+                item = trade.get('item_name', 'N/A')
+                # Обрезаем длинные названия
+                if len(item) > 50:
+                    item = item[:47] + "..."
+                buy_price = trade.get('purchase_price', 0) or 0
+                sell_price = trade.get('sale_price', 0) or 0
+                profit = sell_price - buy_price
+
+                # Цвет профита
+                profit_color = COLORS["accent_green"] if profit >= 0 else COLORS["accent_red"]
+
+                # Дата
+                ctk.CTkLabel(
+                    row_container,
+                    text=str(date),
+                    width=140,
+                    anchor="w",
+                    font=ctk.CTkFont(size=10)
+                ).pack(side="left", padx=5)
+
+                # Предмет (расширяемая колонка)
+                item_label = ctk.CTkLabel(
+                    row_container,
+                    text=str(item),
+                    anchor="w",
+                    font=ctk.CTkFont(size=10)
+                )
+                item_label.pack(side="left", fill="x", expand=True, padx=5)
+
+                # Покупка
+                ctk.CTkLabel(
+                    row_container,
+                    text=f"{buy_price:.0f}",
+                    width=90,
+                    anchor="e",
+                    font=ctk.CTkFont(size=10)
+                ).pack(side="left", padx=5)
+
+                # Продажа
+                ctk.CTkLabel(
+                    row_container,
+                    text=f"{sell_price:.0f}",
+                    width=90,
+                    anchor="e",
+                    font=ctk.CTkFont(size=10)
+                ).pack(side="left", padx=5)
+
+                # Профит
+                ctk.CTkLabel(
+                    row_container,
+                    text=f"{profit:+.0f}",
+                    text_color=profit_color,
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    width=90,
+                    anchor="e"
+                ).pack(side="left", padx=5)
+
+        except Exception as e:
+            logger.error(f"Error refreshing recent trades: {e}", exc_info=True)
+
+    def _refresh_active_orders_table(self):
+        """Обновить таблицу активных ордеров."""
+        if not hasattr(self, 'orders_scrollable'):
+            return
+
+        # Очистить все
+        for widget in self.orders_scrollable.winfo_children():
+            widget.destroy()
+
+        try:
+            # Получить данные из БД
+            active_orders = trades_db.get_all_active_orders()
+
+            # Фильтр по аккаунту если выбран конкретный
+            selected_account = self.account_selector.get() if hasattr(self, 'account_selector') else "Все аккаунты"
+            if selected_account != "Все аккаунты":
+                active_orders = [o for o in active_orders if o.get('account_name') == selected_account]
+
+            # Обновляем счетчик активных ордеров в dashboard
+            if hasattr(self, 'stats_cards') and 'active_orders' in self.stats_cards:
+                if selected_account == "Все аккаунты":
+                    total_count = trades_db.get_active_orders_count()
+                else:
+                    total_count = len([o for o in trades_db.get_all_active_orders() if o.get('account_name') == selected_account])
+                self.stats_cards['active_orders'].value_label.configure(text=str(total_count))
+
+            if not active_orders:
+                ctk.CTkLabel(
+                    self.orders_scrollable,
+                    text="Нет активных ордеров",
+                    font=ctk.CTkFont(size=14)
+                ).pack(pady=20)
+                return
+
+            # Фиксированные ширины колонок
+            col_widths = [130, 550, 120, 180]
+
+            # Создаем заголовок
+            header = ctk.CTkFrame(self.orders_scrollable, fg_color=COLORS["bg_secondary"])
+            header.pack(fill="x", pady=(0, 5))
+
+            headers = [
+                ("Аккаунт", col_widths[0]),
+                ("Предмет", col_widths[1]),
+                ("Цена ₽", col_widths[2]),
+                ("Дата создания", col_widths[3])
+            ]
+            for text, width in headers:
+                ctk.CTkLabel(
+                    header,
+                    text=text,
+                    width=width,
+                    anchor="w",
+                    font=ctk.CTkFont(size=13, weight="bold")
+                ).pack(side="left", padx=8, pady=8)
+
+            # Показать все ордера (без лимита 10)
+            for order in active_orders:
+                row_frame = ctk.CTkFrame(self.orders_scrollable, fg_color=COLORS["bg_tertiary"], corner_radius=4)
+                row_frame.pack(fill="x", pady=2)
+
+                # Данные строки
+                account = order.get('account_name', 'N/A')
+                item = order.get('item_name', 'N/A')
+                # Обрезаем длинные названия
+                if len(item) > 73:
+                    item = item[:70] + "..."
+                price = order.get('order_price', 0) or 0
+                date = order.get('created_at', 'N/A')
+                if date and len(date) > 16:
+                    date = date[:16]
+
+                # Аккаунт
+                ctk.CTkLabel(
+                    row_frame,
+                    text=str(account),
+                    width=col_widths[0],
+                    anchor="w",
+                    font=ctk.CTkFont(size=12)
+                ).pack(side="left", padx=8, pady=6)
+
+                # Предмет
+                ctk.CTkLabel(
+                    row_frame,
+                    text=str(item),
+                    width=col_widths[1],
+                    anchor="w",
+                    font=ctk.CTkFont(size=12),
+                    text_color="#3498db"
+                ).pack(side="left", padx=8, pady=6)
+
+                # Цена
+                ctk.CTkLabel(
+                    row_frame,
+                    text=f"{price:.2f}",
+                    width=col_widths[2],
+                    anchor="w",
+                    font=ctk.CTkFont(size=12)
+                ).pack(side="left", padx=8, pady=6)
+
+                # Дата создания
+                ctk.CTkLabel(
+                    row_frame,
+                    text=str(date),
+                    width=col_widths[3],
+                    anchor="w",
+                    font=ctk.CTkFont(size=12)
+                ).pack(side="left", padx=8, pady=6)
+
+        except Exception as e:
+            logger.error(f"Error refreshing active orders: {e}", exc_info=True)
+
+    def _sync_orders_from_steam(self):
+        """Синхронизировать ордера и инвентарь со Steam без запуска торгового цикла."""
+        from src.async_helper import run_async_in_gui
+
+        async def _sync():
+            results = {'synced': 0, 'filled': 0, 'cancelled': 0, 'errors': []}
+
+            if not self.account_manager:
+                return results
+
+            for account in self.account_manager.get_enabled_accounts():
+                if not account.is_logged_in():
+                    results['errors'].append(f"{account.name}: не авторизован")
+                    continue
+
+                try:
+                    self._log(f"🔄 [{account.name}] Синхронизация ордеров со Steam...")
+
+                    # Получаем активные ордера из Steam
+                    steam_orders = await account.steam_client.get_active_buy_orders()
+                    steam_order_ids = {order['order_id'] for order in steam_orders}
+
+                    self._log(f"[{account.name}] Найдено {len(steam_orders)} активных ордеров в Steam")
+
+                    # Синхронизируем новые ордера в БД
+                    for order in steam_orders:
+                        existing = trades_db.get_order_by_id(order['order_id'])
+                        if not existing:
+                            trades_db.add_order(
+                                account_name=account.name,
+                                item_name=order['market_hash_name'],
+                                market_hash_name=order['market_hash_name'],
+                                order_id=order['order_id'],
+                                order_price=order['price'],
+                                quantity=order['quantity'],
+                                expected_sell_price=None,
+                            )
+                            results['synced'] += 1
+                            self._log(f"[{account.name}] 📥 Добавлен ордер: {order['market_hash_name']}")
+
+                    # Проверяем ордера из БД - исполнены или отменены
+                    db_orders = [o for o in trades_db.get_active_orders() if o['account_name'] == account.name]
+
+                    # Ордера, которых нет в Steam
+                    missing_orders = [
+                        o for o in db_orders
+                        if str(o['order_id']) not in steam_order_ids
+                    ]
+
+                    # Загружаем инвентарь ОДИН раз если есть пропавшие ордера
+                    inventory_counts = {}
+                    if missing_orders:
+                        inventory = await account.steam_client.get_inventory()
+                        if inventory:
+                            for item in inventory:
+                                name = item.market_hash_name
+                                inventory_counts[name] = inventory_counts.get(name, 0) + 1
+
+                    # Учитываем УЖЕ СУЩЕСТВУЮЩИЕ purchased_items для этого аккаунта
+                    existing_purchased = trades_db.get_purchased_items(account_name=account.name)
+                    matched_counts = {}
+                    for item in existing_purchased:
+                        name = item.get('market_hash_name', '')
+                        if name:
+                            matched_counts[name] = matched_counts.get(name, 0) + 1
+
+                    for order in missing_orders:
+                        order_id = str(order['order_id'])
+                        market_hash_name = order.get('market_hash_name', '')
+
+                        available_count = inventory_counts.get(market_hash_name, 0)
+                        matched_count = matched_counts.get(market_hash_name, 0)
+
+                        if market_hash_name and available_count > matched_count:
+                            trades_db.update_order_status(order_id, 'filled')
+                            # Добавляем в purchased_items
+                            trades_db.add_purchased_item(
+                                account_name=account.name,
+                                item_name=order['item_name'],
+                                market_hash_name=market_hash_name,
+                                purchase_price=order['order_price'],
+                                expected_sell_price=order.get('expected_sell_price'),
+                                order_id=order_id,
+                            )
+                            results['filled'] += 1
+                            matched_counts[market_hash_name] = matched_count + 1
+                            self._log(f"[{account.name}] ✅ Исполнен: {order['item_name']}")
+                        else:
+                            trades_db.update_order_status(order_id, 'cancelled')
+                            results['cancelled'] += 1
+                            self._log(f"[{account.name}] ❌ Отменён: {order['item_name']}")
+
+                except Exception as e:
+                    results['errors'].append(f"{account.name}: {str(e)}")
+                    self._log(f"[{account.name}] ⚠️ Ошибка: {e}")
+
+            return results
+
+        try:
+            self._log("🔄 Запуск синхронизации со Steam...")
+            results = run_async_in_gui(_sync(), timeout=60)
+
+            # Обновляем таблицы
+            self._refresh_active_orders_table()
+            self._refresh_inventory_list()
+
+            self._log(
+                f"✅ Синхронизация завершена: "
+                f"+{results['synced']} новых, "
+                f"{results['filled']} исполнено, "
+                f"{results['cancelled']} отменено"
+            )
+
+            if results['errors']:
+                for err in results['errors']:
+                    self._log(f"⚠️ {err}")
+
+        except Exception as e:
+            self._log(f"❌ Ошибка синхронизации: {e}")
+            logger.error(f"Sync error: {e}", exc_info=True)
 
     def _create_accounts_tab(self):
         """Создать вкладку с аккаунтами."""
@@ -282,13 +849,24 @@ class TradingBotGUI(ctk.CTk):
         )
         label.pack(side="left", padx=10)
 
+        # Кнопка "Определить валюту для всех"
+        btn_detect_all = ctk.CTkButton(
+            header,
+            text="🔍 Определить валюту (все)",
+            command=self._detect_all_currencies,
+            width=200,
+            fg_color=COLORS["accent_purple"],
+            hover_color="#7c3aed"
+        )
+        btn_detect_all.pack(side="right", padx=5)
+
         btn_add = ctk.CTkButton(
             header,
             text="➕ Добавить",
             command=self._add_account,
             width=100
         )
-        btn_add.pack(side="right", padx=10)
+        btn_add.pack(side="right", padx=5)
 
         # Список аккаунтов
         self.accounts_scrollable = ctk.CTkScrollableFrame(self.tab_accounts)
@@ -296,12 +874,29 @@ class TradingBotGUI(ctk.CTk):
 
     def _create_orders_tab(self):
         """Создать вкладку с ордерами."""
+        # Заголовок с кнопками
+        header_frame = ctk.CTkFrame(self.tab_orders)
+        header_frame.pack(fill="x", padx=10, pady=10)
+
         label = ctk.CTkLabel(
-            self.tab_orders,
+            header_frame,
             text="📋 Активные ордера",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        label.pack(padx=10, pady=10, anchor="w")
+        label.pack(side="left", padx=10)
+
+        # Кнопка синхронизации ордеров со Steam
+        sync_orders_btn = ctk.CTkButton(
+            header_frame,
+            text="🔄 Синхронизировать со Steam",
+            command=self._sync_orders_from_steam,
+            width=200,
+            height=35,
+            font=ctk.CTkFont(size=13),
+            fg_color=COLORS['accent_blue'],
+            hover_color="#2563eb"
+        )
+        sync_orders_btn.pack(side="right", padx=5)
 
         # Таблица ордеров
         self.orders_scrollable = ctk.CTkScrollableFrame(self.tab_orders)
@@ -309,12 +904,56 @@ class TradingBotGUI(ctk.CTk):
 
     def _create_inventory_tab(self):
         """Создать вкладку с инвентарем."""
+        # Заголовок с фильтрами
+        header_frame = ctk.CTkFrame(self.tab_inventory)
+        header_frame.pack(fill="x", padx=10, pady=10)
+
         label = ctk.CTkLabel(
-            self.tab_inventory,
+            header_frame,
             text="📦 Предметы на холде",
             font=ctk.CTkFont(size=16, weight="bold")
         )
-        label.pack(padx=10, pady=10, anchor="w")
+        label.pack(side="left", padx=10)
+
+        # Кнопка обновления цен
+        refresh_prices_btn = ctk.CTkButton(
+            header_frame,
+            text="🔄 Обновить цены",
+            command=self._refresh_item_prices,
+            width=150,
+            height=35,
+            font=ctk.CTkFont(size=13)
+        )
+        refresh_prices_btn.pack(side="right", padx=5)
+
+        # Фильтр по аккаунту
+        filter_frame = ctk.CTkFrame(self.tab_inventory)
+        filter_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        ctk.CTkLabel(
+            filter_frame,
+            text="Фильтр по аккаунту:",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=10)
+
+        # Получаем список аккаунтов
+        account_names = ["Все аккаунты"]
+        try:
+            from src.account_manager import account_manager
+            if hasattr(account_manager, 'accounts'):
+                account_names.extend([acc.name for acc in account_manager.accounts.values()])
+        except Exception:
+            pass
+
+        self.inventory_account_filter = ctk.CTkComboBox(
+            filter_frame,
+            values=account_names,
+            command=lambda _: self._refresh_inventory_list(),
+            width=200,
+            font=ctk.CTkFont(size=13)
+        )
+        self.inventory_account_filter.pack(side="left", padx=5)
+        self.inventory_account_filter.set("Все аккаунты")
 
         # Таблица предметов
         self.inventory_scrollable = ctk.CTkScrollableFrame(self.tab_inventory)
@@ -351,7 +990,8 @@ class TradingBotGUI(ctk.CTk):
             command=self._rescan_all_items,
             width=180,
             height=38,
-            fg_color="#E67E22",
+            fg_color=COLORS["accent_yellow"],
+            hover_color="#d97706",
             font=ctk.CTkFont(size=13)
         )
         self.rescan_all_btn.pack(side="right", padx=5)
@@ -363,34 +1003,11 @@ class TradingBotGUI(ctk.CTk):
             command=self._scan_new_items,
             width=150,
             height=38,
-            fg_color="#27AE60",
+            fg_color=COLORS["accent_green"],
+            hover_color="#059669",
             font=ctk.CTkFont(size=13)
         )
         self.scan_new_btn.pack(side="right", padx=5)
-
-        # Кнопка Auto Buy
-        self.auto_buy_btn = ctk.CTkButton(
-            header,
-            text="🛒 Auto Buy",
-            command=self._show_auto_buy_dialog,
-            width=130,
-            height=38,
-            fg_color="#9B59B6",
-            font=ctk.CTkFont(size=13)
-        )
-        self.auto_buy_btn.pack(side="right", padx=5)
-
-        # Кнопка Confirmations
-        self.confirmations_btn = ctk.CTkButton(
-            header,
-            text="✅ Подтв.",
-            command=self._show_confirmations_dialog,
-            width=100,
-            height=38,
-            fg_color="#27AE60",
-            font=ctk.CTkFont(size=13)
-        )
-        self.confirmations_btn.pack(side="right", padx=5)
 
         # Статус сканирования
         self.scanner_status_label = ctk.CTkLabel(
@@ -433,7 +1050,8 @@ class TradingBotGUI(ctk.CTk):
             command=self._apply_profit_filter,
             width=150,
             height=35,
-            fg_color="#3498DB",
+            fg_color=COLORS["accent_blue"],
+            hover_color="#2563eb",
             font=ctk.CTkFont(size=13)
         )
         apply_filter_btn.pack(side="left", padx=5)
@@ -442,7 +1060,7 @@ class TradingBotGUI(ctk.CTk):
             filter_frame,
             text="",
             font=ctk.CTkFont(size=13),
-            text_color="gray"
+            text_color=COLORS["text_secondary"]
         )
         items_count_label.pack(side="left", padx=10)
         self.parser_items_count_label = items_count_label
@@ -454,7 +1072,8 @@ class TradingBotGUI(ctk.CTk):
             command=self._toggle_auto_scan,
             width=160,
             height=35,
-            fg_color="#95A5A6",
+            fg_color=COLORS["text_secondary"],
+            hover_color="#6b7280",
             font=ctk.CTkFont(size=13)
         )
         self.auto_scan_toggle_btn.pack(side="right", padx=5)
@@ -466,7 +1085,8 @@ class TradingBotGUI(ctk.CTk):
             command=self._show_statistics_window,
             width=130,
             height=35,
-            fg_color="#16A085",
+            fg_color=COLORS["accent_purple"],
+            hover_color="#7c3aed",
             font=ctk.CTkFont(size=13)
         )
         stats_btn.pack(side="right", padx=5)
@@ -478,7 +1098,8 @@ class TradingBotGUI(ctk.CTk):
             command=self._export_data,
             width=110,
             height=35,
-            fg_color="#D35400",
+            fg_color=COLORS["accent_yellow"],
+            hover_color="#d97706",
             font=ctk.CTkFont(size=13)
         )
         export_btn.pack(side="right", padx=5)
@@ -630,13 +1251,13 @@ class TradingBotGUI(ctk.CTk):
 
                     # Цвет и текст по типу
                     if item['type'] == 'purchased':
-                        fg_color = "#3498DB"
+                        fg_color = COLORS["accent_blue"]
                         type_text = "Куплено"
                     elif item['type'] == 'sold':
-                        fg_color = "#27AE60"
+                        fg_color = COLORS["accent_green"]
                         type_text = "Продано"
                     else:
-                        fg_color = "#95A5A6"
+                        fg_color = COLORS["text_secondary"]
                         type_text = "Ордер"
 
                     date_str = item['date'][:16] if item['date'] else 'N/A'
@@ -669,604 +1290,383 @@ class TradingBotGUI(ctk.CTk):
             )
             error_label.pack(pady=50)
 
+    def _create_settings_section(self, parent, title: str, icon: str = ""):
+        """
+        Создать секцию настроек с красивым оформлением.
+
+        Args:
+            parent: Родительский контейнер
+            title: Заголовок секции
+            icon: Emoji иконка
+
+        Returns:
+            CTkFrame для добавления настроек
+        """
+        # Контейнер секции
+        section_frame = ctk.CTkFrame(
+            parent,
+            corner_radius=12,
+            border_width=1,
+            border_color="#3A3D45",
+            fg_color="#2B2D35"
+        )
+        section_frame.pack(fill="x", padx=10, pady=10)
+
+        # Заголовок секции
+        header_frame = ctk.CTkFrame(section_frame, fg_color="transparent")
+        header_frame.pack(fill="x", padx=15, pady=(15, 10))
+
+        # Цветной индикатор слева
+        indicator = ctk.CTkFrame(
+            header_frame,
+            fg_color="#3498DB",
+            width=4,
+            height=24,
+            corner_radius=2
+        )
+        indicator.pack(side="left", padx=(0, 10))
+
+        # Заголовок
+        ctk.CTkLabel(
+            header_frame,
+            text=f"{icon} {title}",
+            font=ctk.CTkFont(size=15, weight="bold")
+        ).pack(side="left")
+
+        # Контейнер для полей
+        content_frame = ctk.CTkFrame(section_frame, fg_color="transparent")
+        content_frame.pack(fill="x", padx=15, pady=(0, 15))
+
+        return content_frame
+
+    def _create_setting_field(self, parent, label: str, entry_var: str, placeholder: str = "", description: str = ""):
+        """
+        Создать поле настройки с улучшенным стилем.
+
+        Args:
+            parent: Родительский frame
+            label: Название настройки
+            entry_var: Имя переменной для Entry (self.{entry_var})
+            placeholder: Placeholder текст
+            description: Описание (серый текст)
+        """
+        field_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        field_frame.pack(fill="x", pady=8)
+
+        # Label
+        label_widget = ctk.CTkLabel(
+            field_frame,
+            text=label,
+            width=220,
+            anchor="w",
+            font=ctk.CTkFont(size=13)
+        )
+        label_widget.pack(side="left", padx=(0, 15))
+
+        # Entry с улучшенным стилем
+        entry = ctk.CTkEntry(
+            field_frame,
+            width=120,
+            height=35,
+            placeholder_text=placeholder,
+            corner_radius=8,
+            border_width=1,
+            border_color="#3A3D45"
+        )
+        entry.pack(side="left", padx=(0, 15))
+
+        # Сохранить в self
+        setattr(self, entry_var, entry)
+
+        # Description
+        if description:
+            desc_label = ctk.CTkLabel(
+                field_frame,
+                text=description,
+                text_color="#808080",
+                font=ctk.CTkFont(size=11)
+            )
+            desc_label.pack(side="left")
+
     def _create_settings_tab(self):
         """Создать вкладку с настройками."""
         # Заголовок
         header = ctk.CTkLabel(
             self.tab_settings,
             text="⚙️ Настройки бота",
-            font=ctk.CTkFont(size=18, weight="bold")
+            font=ctk.CTkFont(size=20, weight="bold")
         )
-        header.pack(padx=20, pady=20, anchor="w")
+        header.pack(padx=20, pady=(20, 10), anchor="w")
 
-        # Контейнер для настроек
+        # Контейнер для настроек (scrollable)
         settings_frame = ctk.CTkScrollableFrame(self.tab_settings)
-        settings_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        settings_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
-        # === Настройки торговли ===
-        trade_section = ctk.CTkFrame(settings_frame)
-        trade_section.pack(fill="x", pady=10)
+        # === Секция 1: Настройки торговли ===
+        trading_section = self._create_settings_section(settings_frame, "Настройки торговли", "💰")
 
-        trade_label = ctk.CTkLabel(
-            trade_section,
-            text="💰 Настройки торговли",
-            font=ctk.CTkFont(size=14, weight="bold")
+        self._create_setting_field(
+            trading_section,
+            label="Минимальный профит (%):",
+            entry_var="profit_entry",
+            placeholder="5.0",
+            description="Покупать только предметы с профитом выше этого значения"
         )
-        trade_label.pack(padx=15, pady=10, anchor="w")
-
-        # Минимальный процент профита
-        profit_frame = ctk.CTkFrame(trade_section, fg_color="transparent")
-        profit_frame.pack(fill="x", padx=15, pady=5)
-
-        profit_label = ctk.CTkLabel(
-            profit_frame,
-            text="Минимальный профит (%):",
-            width=200,
-            anchor="w"
-        )
-        profit_label.pack(side="left", padx=5)
-
-        self.profit_entry = ctk.CTkEntry(
-            profit_frame,
-            width=100,
-            placeholder_text="5.0"
-        )
-        self.profit_entry.pack(side="left", padx=5)
         self.profit_entry.insert(0, str(self.bot_config.get('min_profit_pct', 5.0)))
 
-        profit_info = ctk.CTkLabel(
-            profit_frame,
-            text="(Покупать только предметы с профитом выше этого значения. Отрицательные значения = покупка в убыток)",
-            text_color="gray"
+        self._create_setting_field(
+            trading_section,
+            label="Интервал между циклами (мин):",
+            entry_var="interval_entry",
+            placeholder="5",
+            description="Пауза между торговыми циклами в 24/7 режиме"
         )
-        profit_info.pack(side="left", padx=10)
-
-        # Интервал между циклами
-        interval_frame = ctk.CTkFrame(trade_section, fg_color="transparent")
-        interval_frame.pack(fill="x", padx=15, pady=5)
-
-        interval_label = ctk.CTkLabel(
-            interval_frame,
-            text="Интервал между циклами (мин):",
-            width=200,
-            anchor="w"
-        )
-        interval_label.pack(side="left", padx=5)
-
-        self.interval_entry = ctk.CTkEntry(
-            interval_frame,
-            width=100,
-            placeholder_text="5"
-        )
-        self.interval_entry.pack(side="left", padx=5)
         self.interval_entry.insert(0, str(self.bot_config.get('cycle_interval_minutes', 5)))
 
-        interval_info = ctk.CTkLabel(
-            interval_frame,
-            text="(Пауза между торговыми циклами в 24/7 режиме)",
-            text_color="gray"
-        )
-        interval_info.pack(side="left", padx=10)
+        # === Секция 2: База данных ===
+        db_section = self._create_settings_section(settings_frame, "База данных", "💾")
 
-        # === Настройки базы данных ===
-        db_section = ctk.CTkFrame(settings_frame)
-        db_section.pack(fill="x", pady=10)
-
-        db_label = ctk.CTkLabel(
-            db_section,
-            text="💾 База данных",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        db_label.pack(padx=15, pady=10, anchor="w")
-
-        # Путь к bottm.db
+        # Путь к БД (отдельная обработка для ширины 300px)
         db_frame = ctk.CTkFrame(db_section, fg_color="transparent")
-        db_frame.pack(fill="x", padx=15, pady=5)
+        db_frame.pack(fill="x", pady=8)
 
-        db_path_label = ctk.CTkLabel(
+        ctk.CTkLabel(
             db_frame,
             text="Путь к bottm.db:",
-            width=200,
-            anchor="w"
-        )
-        db_path_label.pack(side="left", padx=5)
+            width=220,
+            anchor="w",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=(0, 15))
 
         self.db_path_entry = ctk.CTkEntry(
             db_frame,
             width=300,
-            placeholder_text="data/main.db"
+            height=35,
+            placeholder_text="data/main.db",
+            corner_radius=8,
+            border_width=1,
+            border_color="#3A3D45"
         )
-        self.db_path_entry.pack(side="left", padx=5)
+        self.db_path_entry.pack(side="left", padx=(0, 15))
         self.db_path_entry.insert(0, self.bot_config.get('bottm_db_path', 'data/main.db'))
 
-        db_info = ctk.CTkLabel(
+        ctk.CTkLabel(
             db_frame,
-            text="(База данных с прибыльными предметами)",
-            text_color="gray"
+            text="База данных с прибыльными предметами",
+            text_color="#808080",
+            font=ctk.CTkFont(size=11)
+        ).pack(side="left")
+
+        # === Секция 3: Выставление ордеров ===
+        orders_section = self._create_settings_section(settings_frame, "Выставление ордеров", "📋")
+
+        self._create_setting_field(
+            orders_section,
+            label="Мин. цена предмета (RUB):",
+            entry_var="trade_min_price_entry",
+            placeholder="100",
+            description="Минимальная цена для выставления ордеров"
         )
-        db_info.pack(side="left", padx=10)
-
-        # === Настройки торговли (выставление ордеров) ===
-        trading_section = ctk.CTkFrame(settings_frame)
-        trading_section.pack(fill="x", pady=10)
-
-        trading_label = ctk.CTkLabel(
-            trading_section,
-            text="💰 Настройки торговли (выставление ордеров)",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        trading_label.pack(padx=15, pady=10, anchor="w")
-
-        # Минимальная цена предмета для покупки
-        trade_min_price_frame = ctk.CTkFrame(trading_section, fg_color="transparent")
-        trade_min_price_frame.pack(fill="x", padx=15, pady=5)
-
-        trade_min_price_label = ctk.CTkLabel(
-            trade_min_price_frame,
-            text="Мин. цена предмета (RUB):",
-            width=200,
-            anchor="w"
-        )
-        trade_min_price_label.pack(side="left", padx=5)
-
-        self.trade_min_price_entry = ctk.CTkEntry(
-            trade_min_price_frame,
-            width=100,
-            placeholder_text="100"
-        )
-        self.trade_min_price_entry.pack(side="left", padx=5)
         self.trade_min_price_entry.insert(0, str(self.bot_config.get('trade_min_price', 100)))
 
-        trade_min_price_info = ctk.CTkLabel(
-            trade_min_price_frame,
-            text="(Минимальная цена для выставления ордеров)",
-            text_color="gray"
+        self._create_setting_field(
+            orders_section,
+            label="Макс. цена предмета (RUB):",
+            entry_var="trade_max_price_entry",
+            placeholder="5000",
+            description="Максимальная цена для выставления ордеров"
         )
-        trade_min_price_info.pack(side="left", padx=10)
-
-        # Максимальная цена предмета для покупки
-        trade_max_price_frame = ctk.CTkFrame(trading_section, fg_color="transparent")
-        trade_max_price_frame.pack(fill="x", padx=15, pady=5)
-
-        trade_max_price_label = ctk.CTkLabel(
-            trade_max_price_frame,
-            text="Макс. цена предмета (RUB):",
-            width=200,
-            anchor="w"
-        )
-        trade_max_price_label.pack(side="left", padx=5)
-
-        self.trade_max_price_entry = ctk.CTkEntry(
-            trade_max_price_frame,
-            width=100,
-            placeholder_text="5000"
-        )
-        self.trade_max_price_entry.pack(side="left", padx=5)
         self.trade_max_price_entry.insert(0, str(self.bot_config.get('trade_max_price', 5000)))
 
-        trade_max_price_info = ctk.CTkLabel(
-            trade_max_price_frame,
-            text="(Максимальная цена для выставления ордеров)",
-            text_color="gray"
-        )
-        trade_max_price_info.pack(side="left", padx=10)
+        # === Секция 4: TM Parser (сканер) ===
+        parser_section = self._create_settings_section(settings_frame, "TM Parser (сканер выгодных предметов)", "🔍")
 
-        # === Настройки TM Parser (bottm) ===
-        parser_section = ctk.CTkFrame(settings_frame)
-        parser_section.pack(fill="x", pady=10)
-
-        parser_label = ctk.CTkLabel(
+        self._create_setting_field(
             parser_section,
-            text="🔍 Настройки TM Parser (сканер выгодных предметов)",
-            font=ctk.CTkFont(size=14, weight="bold")
+            label="Минимальная цена (RUB):",
+            entry_var="min_price_entry",
+            placeholder="1000",
+            description="Фильтр дешевых предметов"
         )
-        parser_label.pack(padx=15, pady=10, anchor="w")
-
-        # Минимальная цена
-        min_price_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        min_price_frame.pack(fill="x", padx=15, pady=5)
-
-        min_price_label = ctk.CTkLabel(
-            min_price_frame,
-            text="Минимальная цена (RUB):",
-            width=200,
-            anchor="w"
-        )
-        min_price_label.pack(side="left", padx=5)
-
-        self.min_price_entry = ctk.CTkEntry(
-            min_price_frame,
-            width=100,
-            placeholder_text="1000"
-        )
-        self.min_price_entry.pack(side="left", padx=5)
         self.min_price_entry.insert(0, str(self.bot_config.get('scanner_min_price', 1000)))
 
-        min_price_info = ctk.CTkLabel(
-            min_price_frame,
-            text="(Фильтр дешевых предметов)",
-            text_color="gray"
+        self._create_setting_field(
+            parser_section,
+            label="Максимальная цена (RUB):",
+            entry_var="max_price_entry",
+            placeholder="10000",
+            description="Фильтр дорогих предметов"
         )
-        min_price_info.pack(side="left", padx=10)
-
-        # Максимальная цена
-        max_price_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        max_price_frame.pack(fill="x", padx=15, pady=5)
-
-        max_price_label = ctk.CTkLabel(
-            max_price_frame,
-            text="Максимальная цена (RUB):",
-            width=200,
-            anchor="w"
-        )
-        max_price_label.pack(side="left", padx=5)
-
-        self.max_price_entry = ctk.CTkEntry(
-            max_price_frame,
-            width=100,
-            placeholder_text="10000"
-        )
-        self.max_price_entry.pack(side="left", padx=5)
         self.max_price_entry.insert(0, str(self.bot_config.get('scanner_max_price', 10000)))
 
-        max_price_info = ctk.CTkLabel(
-            max_price_frame,
-            text="(Фильтр дорогих предметов)",
-            text_color="gray"
+        self._create_setting_field(
+            parser_section,
+            label="Мин. профит сканера (%):",
+            entry_var="scanner_profit_entry",
+            placeholder="-5.0",
+            description="Порог для сохранения предмета в БД (может быть отрицательным)"
         )
-        max_price_info.pack(side="left", padx=10)
-
-        # Минимальный профит для сканера
-        scanner_profit_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        scanner_profit_frame.pack(fill="x", padx=15, pady=5)
-
-        scanner_profit_label = ctk.CTkLabel(
-            scanner_profit_frame,
-            text="Мин. профит сканера (%):",
-            width=200,
-            anchor="w"
-        )
-        scanner_profit_label.pack(side="left", padx=5)
-
-        self.scanner_profit_entry = ctk.CTkEntry(
-            scanner_profit_frame,
-            width=100,
-            placeholder_text="-5.0"
-        )
-        self.scanner_profit_entry.pack(side="left", padx=5)
         self.scanner_profit_entry.insert(0, str(self.bot_config.get('scanner_min_profit', -5.0)))
 
-        scanner_profit_info = ctk.CTkLabel(
-            scanner_profit_frame,
-            text="(Порог для сохранения предмета в БД, может быть отрицательным)",
-            text_color="gray"
+        self._create_setting_field(
+            parser_section,
+            label="Комиссия CSGO.TM (%):",
+            entry_var="commission_entry",
+            placeholder="7.0",
+            description="Комиссия площадки при продаже"
         )
-        scanner_profit_info.pack(side="left", padx=10)
-
-        # Комиссия CSGO.TM
-        commission_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        commission_frame.pack(fill="x", padx=15, pady=5)
-
-        commission_label = ctk.CTkLabel(
-            commission_frame,
-            text="Комиссия CSGO.TM (%):",
-            width=200,
-            anchor="w"
-        )
-        commission_label.pack(side="left", padx=5)
-
-        self.commission_entry = ctk.CTkEntry(
-            commission_frame,
-            width=100,
-            placeholder_text="7.0"
-        )
-        self.commission_entry.pack(side="left", padx=5)
         self.commission_entry.insert(0, str(self.bot_config.get('csgo_commission', 7.0)))
 
-        commission_info = ctk.CTkLabel(
-            commission_frame,
-            text="(Комиссия площадки при продаже)",
-            text_color="gray"
+        self._create_setting_field(
+            parser_section,
+            label="Мин. продаж за 7 дней:",
+            entry_var="sales_7d_entry",
+            placeholder="50",
+            description="Фильтр ликвидности предметов"
         )
-        commission_info.pack(side="left", padx=10)
-
-        # Минимальные продажи за 7 дней
-        sales_7d_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        sales_7d_frame.pack(fill="x", padx=15, pady=5)
-
-        sales_7d_label = ctk.CTkLabel(
-            sales_7d_frame,
-            text="Мин. продаж за 7 дней:",
-            width=200,
-            anchor="w"
-        )
-        sales_7d_label.pack(side="left", padx=5)
-
-        self.sales_7d_entry = ctk.CTkEntry(
-            sales_7d_frame,
-            width=100,
-            placeholder_text="50"
-        )
-        self.sales_7d_entry.pack(side="left", padx=5)
         self.sales_7d_entry.insert(0, str(self.bot_config.get('min_sales_7d', 50)))
 
-        sales_7d_info = ctk.CTkLabel(
-            sales_7d_frame,
-            text="(Фильтр ликвидности предметов)",
-            text_color="gray"
-        )
-        sales_7d_info.pack(side="left", padx=10)
-
-        # Путь к файлу прокси
+        # Файл прокси (отдельная обработка для ширины 300px)
         proxy_file_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        proxy_file_frame.pack(fill="x", padx=15, pady=5)
+        proxy_file_frame.pack(fill="x", pady=8)
 
-        proxy_file_label = ctk.CTkLabel(
+        ctk.CTkLabel(
             proxy_file_frame,
             text="Файл прокси:",
-            width=200,
-            anchor="w"
-        )
-        proxy_file_label.pack(side="left", padx=5)
+            width=220,
+            anchor="w",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=(0, 15))
 
         self.proxy_file_entry = ctk.CTkEntry(
             proxy_file_frame,
             width=300,
-            placeholder_text="proxies.txt"
+            height=35,
+            placeholder_text="proxies.txt",
+            corner_radius=8,
+            border_width=1,
+            border_color="#3A3D45"
         )
-        self.proxy_file_entry.pack(side="left", padx=5)
+        self.proxy_file_entry.pack(side="left", padx=(0, 15))
         self.proxy_file_entry.insert(0, self.bot_config.get('proxy_file', 'proxies.txt'))
 
-        proxy_file_info = ctk.CTkLabel(
+        ctk.CTkLabel(
             proxy_file_frame,
-            text="(Опционально. Файл со списком прокси, по одному на строку)",
-            text_color="gray"
-        )
-        proxy_file_info.pack(side="left", padx=10)
+            text="Файл со списком прокси (опционально)",
+            text_color="#808080",
+            font=ctk.CTkFont(size=11)
+        ).pack(side="left")
 
-        # Запросов на прокси
-        requests_per_proxy_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        requests_per_proxy_frame.pack(fill="x", padx=15, pady=5)
-
-        requests_per_proxy_label = ctk.CTkLabel(
-            requests_per_proxy_frame,
-            text="Запросов на прокси:",
-            width=200,
-            anchor="w"
+        self._create_setting_field(
+            parser_section,
+            label="Запросов на прокси:",
+            entry_var="requests_per_proxy_entry",
+            placeholder="15",
+            description="Менять прокси после N запросов"
         )
-        requests_per_proxy_label.pack(side="left", padx=5)
-
-        self.requests_per_proxy_entry = ctk.CTkEntry(
-            requests_per_proxy_frame,
-            width=100,
-            placeholder_text="15"
-        )
-        self.requests_per_proxy_entry.pack(side="left", padx=5)
         self.requests_per_proxy_entry.insert(0, str(self.bot_config.get('requests_per_proxy', 15)))
 
-        requests_per_proxy_info = ctk.CTkLabel(
-            requests_per_proxy_frame,
-            text="(Менять прокси после N запросов)",
-            text_color="gray"
+        self._create_setting_field(
+            parser_section,
+            label="Макс. предметов для скана:",
+            entry_var="max_items_entry",
+            placeholder="10",
+            description="Количество предметов за один проход"
         )
-        requests_per_proxy_info.pack(side="left", padx=10)
-
-        # Максимум предметов для сканирования
-        max_items_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        max_items_frame.pack(fill="x", padx=15, pady=5)
-
-        max_items_label = ctk.CTkLabel(
-            max_items_frame,
-            text="Макс. предметов для скана:",
-            width=200,
-            anchor="w"
-        )
-        max_items_label.pack(side="left", padx=5)
-
-        self.max_items_entry = ctk.CTkEntry(
-            max_items_frame,
-            width=100,
-            placeholder_text="10"
-        )
-        self.max_items_entry.pack(side="left", padx=5)
         self.max_items_entry.insert(0, str(self.bot_config.get('scanner_max_items', 10)))
 
-        max_items_info = ctk.CTkLabel(
-            max_items_frame,
-            text="(Количество предметов за один проход)",
-            text_color="gray"
+        self._create_setting_field(
+            parser_section,
+            label="Задержка между запросами (сек):",
+            entry_var="delay_entry",
+            placeholder="7.0",
+            description="Задержка для избежания блокировки"
         )
-        max_items_info.pack(side="left", padx=10)
-
-        # Задержка между запросами
-        delay_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        delay_frame.pack(fill="x", padx=15, pady=5)
-
-        delay_label = ctk.CTkLabel(
-            delay_frame,
-            text="Задержка между запросами (сек):",
-            width=200,
-            anchor="w"
-        )
-        delay_label.pack(side="left", padx=5)
-
-        self.delay_entry = ctk.CTkEntry(
-            delay_frame,
-            width=100,
-            placeholder_text="7.0"
-        )
-        self.delay_entry.pack(side="left", padx=5)
         self.delay_entry.insert(0, str(self.bot_config.get('scanner_delay', 7.0)))
 
-        delay_info = ctk.CTkLabel(
-            delay_frame,
-            text="(Задержка для избежания блокировки)",
-            text_color="gray"
+        self._create_setting_field(
+            parser_section,
+            label="Параллельных воркеров:",
+            entry_var="workers_entry",
+            placeholder="1",
+            description="Количество одновременных запросов"
         )
-        delay_info.pack(side="left", padx=10)
-
-        # Параллельные воркеры
-        workers_frame = ctk.CTkFrame(parser_section, fg_color="transparent")
-        workers_frame.pack(fill="x", padx=15, pady=5)
-
-        workers_label = ctk.CTkLabel(
-            workers_frame,
-            text="Параллельных воркеров:",
-            width=200,
-            anchor="w"
-        )
-        workers_label.pack(side="left", padx=5)
-
-        self.workers_entry = ctk.CTkEntry(
-            workers_frame,
-            width=100,
-            placeholder_text="1"
-        )
-        self.workers_entry.pack(side="left", padx=5)
         self.workers_entry.insert(0, str(self.bot_config.get('scanner_workers', 1)))
 
-        workers_info = ctk.CTkLabel(
-            workers_frame,
-            text="(Количество одновременных запросов)",
-            text_color="gray"
-        )
-        workers_info.pack(side="left", padx=10)
+        # === Секция 5: Auto Scanner ===
+        auto_scanner_section = self._create_settings_section(settings_frame, "Auto Scanner (автоматическое сканирование)", "⏰")
 
-        # === Настройки Auto Buyer ===
-        auto_buyer_section = ctk.CTkFrame(settings_frame)
-        auto_buyer_section.pack(fill="x", pady=10)
-
-        auto_buyer_label = ctk.CTkLabel(
-            auto_buyer_section,
-            text="🛒 Настройки Auto Buyer (автоматическая покупка)",
-            font=ctk.CTkFont(size=14, weight="bold")
-        )
-        auto_buyer_label.pack(padx=15, pady=10, anchor="w")
-
-        # Макс. предметов для автопокупки
-        ab_max_items_frame = ctk.CTkFrame(auto_buyer_section, fg_color="transparent")
-        ab_max_items_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(ab_max_items_frame, text="Макс. предметов:", width=200, anchor="w").pack(side="left", padx=5)
-        self.ab_max_items_entry = ctk.CTkEntry(ab_max_items_frame, width=100, placeholder_text="10")
-        self.ab_max_items_entry.insert(0, str(self.bot_config.get('auto_buy_max_items', 10)))
-        self.ab_max_items_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(ab_max_items_frame, text="(Купить не более N предметов за раз)", text_color="gray").pack(side="left", padx=10)
-
-        # Макс. цена за предмет
-        ab_max_price_frame = ctk.CTkFrame(auto_buyer_section, fg_color="transparent")
-        ab_max_price_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(ab_max_price_frame, text="Макс. цена (₽):", width=200, anchor="w").pack(side="left", padx=5)
-        self.ab_max_price_entry = ctk.CTkEntry(ab_max_price_frame, width=100, placeholder_text="1000.0")
-        self.ab_max_price_entry.insert(0, str(self.bot_config.get('auto_buy_max_price', 1000.0)))
-        self.ab_max_price_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(ab_max_price_frame, text="(Не покупать предметы дороже этой цены)", text_color="gray").pack(side="left", padx=10)
-
-        # Общий бюджет
-        ab_budget_frame = ctk.CTkFrame(auto_buyer_section, fg_color="transparent")
-        ab_budget_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(ab_budget_frame, text="Общий бюджет (₽):", width=200, anchor="w").pack(side="left", padx=5)
-        self.ab_budget_entry = ctk.CTkEntry(ab_budget_frame, width=100, placeholder_text="5000.0")
-        self.ab_budget_entry.insert(0, str(self.bot_config.get('auto_buy_total_budget', 5000.0)))
-        self.ab_budget_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(ab_budget_frame, text="(Максимальная сумма всех покупок)", text_color="gray").pack(side="left", padx=10)
-
-        # Мин. профит для автопокупки
-        ab_min_profit_frame = ctk.CTkFrame(auto_buyer_section, fg_color="transparent")
-        ab_min_profit_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(ab_min_profit_frame, text="Мин. профит (%):", width=200, anchor="w").pack(side="left", padx=5)
-        self.ab_min_profit_entry = ctk.CTkEntry(ab_min_profit_frame, width=100, placeholder_text="15.0")
-        self.ab_min_profit_entry.insert(0, str(self.bot_config.get('auto_buy_min_profit', 15.0)))
-        self.ab_min_profit_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(ab_min_profit_frame, text="(Покупать только с профитом выше этого)", text_color="gray").pack(side="left", padx=10)
-
-        # === Настройки Auto Scanner ===
-        auto_scanner_section = ctk.CTkFrame(settings_frame)
-        auto_scanner_section.pack(fill="x", pady=10)
-
-        auto_scanner_label = ctk.CTkLabel(
+        self._create_setting_field(
             auto_scanner_section,
-            text="⏰ Настройки Auto Scanner (автоматическое сканирование)",
-            font=ctk.CTkFont(size=14, weight="bold")
+            label="Интервал новых (мин):",
+            entry_var="as_interval_entry",
+            placeholder="30",
+            description="Искать новые предметы каждые N минут"
         )
-        auto_scanner_label.pack(padx=15, pady=10, anchor="w")
-
-        # Интервал сканирования
-        as_interval_frame = ctk.CTkFrame(auto_scanner_section, fg_color="transparent")
-        as_interval_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(as_interval_frame, text="Интервал (минуты):", width=200, anchor="w").pack(side="left", padx=5)
-        self.as_interval_entry = ctk.CTkEntry(as_interval_frame, width=100, placeholder_text="30")
         self.as_interval_entry.insert(0, str(self.bot_config.get('auto_scan_interval', 30)))
-        self.as_interval_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(as_interval_frame, text="(Запускать сканирование каждые N минут)", text_color="gray").pack(side="left", padx=10)
 
-        # === Настройки Proxy Manager ===
-        proxy_manager_section = ctk.CTkFrame(settings_frame)
-        proxy_manager_section.pack(fill="x", pady=10)
+        self._create_setting_field(
+            auto_scanner_section,
+            label="Кол-во новых:",
+            entry_var="as_new_items_entry",
+            placeholder="10",
+            description="Сколько новых предметов искать за раз"
+        )
+        self.as_new_items_entry.insert(0, str(self.bot_config.get('auto_scan_new_items', 10)))
 
-        proxy_manager_label = ctk.CTkLabel(
+        self._create_setting_field(
+            auto_scanner_section,
+            label="Интервал ресканирования (мин):",
+            entry_var="as_rescan_entry",
+            placeholder="60",
+            description="Проверять актуальность БД каждые N минут"
+        )
+        self.as_rescan_entry.insert(0, str(self.bot_config.get('auto_rescan_interval', 60)))
+
+        # === Секция 6: Proxy Manager ===
+        proxy_manager_section = self._create_settings_section(settings_frame, "Proxy Manager (ротация прокси)", "🔄")
+
+        self._create_setting_field(
             proxy_manager_section,
-            text="🔄 Настройки Proxy Manager (ротация прокси)",
-            font=ctk.CTkFont(size=14, weight="bold")
+            label="Макс. запросов:",
+            entry_var="pm_max_requests_entry",
+            placeholder="15",
+            description="Менять прокси после N запросов"
         )
-        proxy_manager_label.pack(padx=15, pady=10, anchor="w")
-
-        # Макс. запросов на прокси
-        pm_max_requests_frame = ctk.CTkFrame(proxy_manager_section, fg_color="transparent")
-        pm_max_requests_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(pm_max_requests_frame, text="Макс. запросов:", width=200, anchor="w").pack(side="left", padx=5)
-        self.pm_max_requests_entry = ctk.CTkEntry(pm_max_requests_frame, width=100, placeholder_text="15")
         self.pm_max_requests_entry.insert(0, str(self.bot_config.get('proxy_max_requests', 15)))
-        self.pm_max_requests_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(pm_max_requests_frame, text="(Менять прокси после N запросов)", text_color="gray").pack(side="left", padx=10)
 
-        # Cooldown прокси
-        pm_cooldown_frame = ctk.CTkFrame(proxy_manager_section, fg_color="transparent")
-        pm_cooldown_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(pm_cooldown_frame, text="Cooldown (секунды):", width=200, anchor="w").pack(side="left", padx=5)
-        self.pm_cooldown_entry = ctk.CTkEntry(pm_cooldown_frame, width=100, placeholder_text="60")
-        self.pm_cooldown_entry.insert(0, str(self.bot_config.get('proxy_cooldown', 60)))
-        self.pm_cooldown_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(pm_cooldown_frame, text="(Пауза перед повторным использованием)", text_color="gray").pack(side="left", padx=10)
-
-        # Время блокировки прокси
-        pm_blacklist_frame = ctk.CTkFrame(proxy_manager_section, fg_color="transparent")
-        pm_blacklist_frame.pack(fill="x", padx=15, pady=5)
-
-        ctk.CTkLabel(pm_blacklist_frame, text="Blacklist (минуты):", width=200, anchor="w").pack(side="left", padx=5)
-        self.pm_blacklist_entry = ctk.CTkEntry(pm_blacklist_frame, width=100, placeholder_text="30")
-        self.pm_blacklist_entry.insert(0, str(self.bot_config.get('proxy_blacklist_duration', 30)))
-        self.pm_blacklist_entry.pack(side="left", padx=5)
-        ctk.CTkLabel(pm_blacklist_frame, text="(Время блокировки плохого прокси)", text_color="gray").pack(side="left", padx=10)
-
-        # === Дополнительные настройки ===
-        extra_section = ctk.CTkFrame(settings_frame)
-        extra_section.pack(fill="x", pady=10)
-
-        extra_label = ctk.CTkLabel(
-            extra_section,
-            text="🔧 Дополнительные настройки",
-            font=ctk.CTkFont(size=14, weight="bold")
+        self._create_setting_field(
+            proxy_manager_section,
+            label="Cooldown (секунды):",
+            entry_var="pm_cooldown_entry",
+            placeholder="60",
+            description="Пауза перед повторным использованием"
         )
-        extra_label.pack(padx=15, pady=10, anchor="w")
+        self.pm_cooldown_entry.insert(0, str(self.bot_config.get('proxy_cooldown', 60)))
 
-        # Автообновление статистики
+        self._create_setting_field(
+            proxy_manager_section,
+            label="Blacklist (минуты):",
+            entry_var="pm_blacklist_entry",
+            placeholder="30",
+            description="Время блокировки плохого прокси"
+        )
+        self.pm_blacklist_entry.insert(0, str(self.bot_config.get('proxy_blacklist_duration', 30)))
+
+        # === Секция 7: Дополнительные настройки ===
+        extra_section = self._create_settings_section(settings_frame, "Дополнительные настройки", "🔧")
+
+        # Автообновление статистики (switch)
         auto_refresh_frame = ctk.CTkFrame(extra_section, fg_color="transparent")
-        auto_refresh_frame.pack(fill="x", padx=15, pady=5)
+        auto_refresh_frame.pack(fill="x", pady=8)
 
-        auto_refresh_label = ctk.CTkLabel(
+        ctk.CTkLabel(
             auto_refresh_frame,
             text="Автообновление статистики:",
-            width=200,
-            anchor="w"
-        )
-        auto_refresh_label.pack(side="left", padx=5)
+            width=220,
+            anchor="w",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=(0, 15))
 
         self.auto_refresh_var = ctk.BooleanVar(value=self.bot_config.get('auto_refresh', True))
         auto_refresh_switch = ctk.CTkSwitch(
@@ -1274,19 +1674,19 @@ class TradingBotGUI(ctk.CTk):
             text="Включено",
             variable=self.auto_refresh_var
         )
-        auto_refresh_switch.pack(side="left", padx=5)
+        auto_refresh_switch.pack(side="left")
 
-        # Показывать отладочные логи
+        # Отладочные логи (switch)
         debug_frame = ctk.CTkFrame(extra_section, fg_color="transparent")
-        debug_frame.pack(fill="x", padx=15, pady=5)
+        debug_frame.pack(fill="x", pady=8)
 
-        debug_label = ctk.CTkLabel(
+        ctk.CTkLabel(
             debug_frame,
             text="Отладочные логи:",
-            width=200,
-            anchor="w"
-        )
-        debug_label.pack(side="left", padx=5)
+            width=220,
+            anchor="w",
+            font=ctk.CTkFont(size=13)
+        ).pack(side="left", padx=(0, 15))
 
         self.debug_var = ctk.BooleanVar(value=self.bot_config.get('debug_mode', False))
         debug_switch = ctk.CTkSwitch(
@@ -1294,7 +1694,7 @@ class TradingBotGUI(ctk.CTk):
             text="Включено",
             variable=self.debug_var
         )
-        debug_switch.pack(side="left", padx=5)
+        debug_switch.pack(side="left")
 
         # Кнопки управления настройками
         btn_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
@@ -1357,22 +1757,49 @@ class TradingBotGUI(ctk.CTk):
 
     def _create_statusbar(self):
         """Создать статус бар."""
-        self.statusbar = ctk.CTkFrame(self, height=30)
+        self.statusbar = ctk.CTkFrame(
+            self,
+            height=35,
+            fg_color=COLORS["bg_tertiary"],
+            corner_radius=0
+        )
         self.statusbar.pack(fill="x", side="bottom")
 
-        self.status_label = ctk.CTkLabel(
+        # Версия
+        version_label = ctk.CTkLabel(
             self.statusbar,
-            text="⏸️ Бот остановлен",
-            font=ctk.CTkFont(size=12)
+            text="v2.0",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_secondary"]
         )
-        self.status_label.pack(side="left", padx=10, pady=5)
+        version_label.pack(side="left", padx=15, pady=5)
 
+        # Разделитель
+        sep1 = ctk.CTkLabel(
+            self.statusbar,
+            text="|",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["border"]
+        )
+        sep1.pack(side="left")
+
+        # Статистика подключений
+        self.connection_label = ctk.CTkLabel(
+            self.statusbar,
+            text="🌐 Не подключено",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_secondary"]
+        )
+        self.connection_label.pack(side="left", padx=15, pady=5)
+
+        # Время
         self.time_label = ctk.CTkLabel(
             self.statusbar,
             text=f"🕒 {datetime.now().strftime('%H:%M:%S')}",
-            font=ctk.CTkFont(size=12)
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["text_secondary"]
         )
-        self.time_label.pack(side="right", padx=10, pady=5)
+        self.time_label.pack(side="right", padx=15, pady=5)
 
         # Обновление времени
         self._update_time()
@@ -1380,6 +1807,13 @@ class TradingBotGUI(ctk.CTk):
     def _update_time(self):
         """Обновить время в статус баре."""
         self.time_label.configure(text=f"🕒 {datetime.now().strftime('%H:%M:%S')}")
+
+        # Обновляем статус подключений
+        if self.account_manager:
+            logged_in = sum(1 for acc in self.account_manager.accounts if acc.is_logged_in())
+            total = len(self.account_manager.accounts)
+            self.connection_label.configure(text=f"🌐 {logged_in}/{total} аккаунтов")
+
         self.after(1000, self._update_time)
 
     # ========== Логика управления ботом ==========
@@ -1395,8 +1829,18 @@ class TradingBotGUI(ctk.CTk):
             self._log(f"✅ Загружено аккаунтов: {len(self.account_manager.accounts)}")
             self._refresh_accounts_list()
 
+            # Обновляем список аккаунтов в селекторе dashboard
+            if hasattr(self, 'account_selector'):
+                account_names = ["Все аккаунты"]
+                account_names.extend([acc.name for acc in self.account_manager.accounts])
+                self.account_selector.configure(values=account_names)
+                self._log(f"✅ Обновлен селектор аккаунтов: {len(account_names)} вариантов")
+
             # Обновляем балансы аккаунтов после загрузки
             self._update_accounts_balances()
+
+            # Обновляем dashboard stats после загрузки аккаунтов
+            self._update_dashboard_stats()
 
         except Exception as e:
             self._log(f"❌ Ошибка загрузки аккаунтов: {e}")
@@ -1521,14 +1965,10 @@ class TradingBotGUI(ctk.CTk):
             self.bot_config['scanner_delay'] = float(self.delay_entry.get())
             self.bot_config['scanner_workers'] = int(self.workers_entry.get())
 
-            # Auto Buyer настройки
-            self.bot_config['auto_buy_max_items'] = int(self.ab_max_items_entry.get())
-            self.bot_config['auto_buy_max_price'] = float(self.ab_max_price_entry.get())
-            self.bot_config['auto_buy_total_budget'] = float(self.ab_budget_entry.get())
-            self.bot_config['auto_buy_min_profit'] = float(self.ab_min_profit_entry.get())
-
             # Auto Scanner настройки
             self.bot_config['auto_scan_interval'] = int(self.as_interval_entry.get())
+            self.bot_config['auto_scan_new_items'] = int(self.as_new_items_entry.get())
+            self.bot_config['auto_rescan_interval'] = int(self.as_rescan_entry.get())
 
             # Proxy Manager настройки
             self.bot_config['proxy_max_requests'] = int(self.pm_max_requests_entry.get())
@@ -1564,6 +2004,9 @@ class TradingBotGUI(ctk.CTk):
             'bottm_db_path': 'data/main.db',
             'auto_refresh': True,
             'debug_mode': False,
+            'auto_scan_interval': 30,
+            'auto_scan_new_items': 10,
+            'auto_rescan_interval': 60,
         }
 
         # Обновляем поля
@@ -1578,6 +2021,17 @@ class TradingBotGUI(ctk.CTk):
 
         self.auto_refresh_var.set(True)
         self.debug_var.set(False)
+
+        # Auto Scanner поля
+        if hasattr(self, 'as_interval_entry'):
+            self.as_interval_entry.delete(0, 'end')
+            self.as_interval_entry.insert(0, "30")
+        if hasattr(self, 'as_new_items_entry'):
+            self.as_new_items_entry.delete(0, 'end')
+            self.as_new_items_entry.insert(0, "10")
+        if hasattr(self, 'as_rescan_entry'):
+            self.as_rescan_entry.delete(0, 'end')
+            self.as_rescan_entry.insert(0, "60")
 
         self._log("🔄 Настройки сброшены к значениям по умолчанию")
 
@@ -1596,6 +2050,12 @@ class TradingBotGUI(ctk.CTk):
         # Добавляем аккаунты
         for account in self.account_manager.accounts:
             self._create_account_card(account)
+
+        # Обновляем селектор аккаунтов в dashboard
+        if hasattr(self, 'account_selector'):
+            account_names = ["Все аккаунты"]
+            account_names.extend([acc.name for acc in self.account_manager.accounts])
+            self.account_selector.configure(values=account_names)
 
     def _create_account_card(self, account):
         """Создать карточку аккаунта."""
@@ -1698,10 +2158,44 @@ class TradingBotGUI(ctk.CTk):
 
             # Логин аккаунтов
             self._log("🔐 Логин в аккаунты...")
-            login_results = self.account_manager.login_all()
+            login_results = self.account_manager.login_all_sync()
 
             logged_in_count = sum(1 for v in login_results.values() if v)
             self._log(f"✅ Залогинено: {logged_in_count}/{len(login_results)}")
+
+            # Автоматически определяем валюту для аккаунтов, если не была определена
+            self._log("🔍 Проверка валют аккаунтов...")
+            for account in self.account_manager.get_enabled_accounts():
+                if not self.bot_running:
+                    break
+
+                # Skip if account is not logged in
+                if not account.is_logged_in():
+                    self._log(f"[{account.name}] ⚠️ Пропущено (не залогинен)")
+                    continue
+
+                # Используем новый async метод для определения валюты
+                try:
+                    self._log(f"[{account.name}] Определение валюты...")
+                    detected_currency = account.detect_currency_sync()
+
+                    if detected_currency:
+                        balance = account.get_wallet_balance_sync()
+                        self._log(f"[{account.name}] ✅ Валюта: {detected_currency}, Баланс: {balance:.2f} {detected_currency}")
+                    else:
+                        self._log(f"[{account.name}] ℹ️ Используется валюта по умолчанию: {account.config.currency}")
+
+                except Exception as e:
+                    self._log(f"[{account.name}] ❌ Ошибка определения валюты: {e}")
+                    self._log(f"[{account.name}] ℹ️ Используется валюта по умолчанию: {account.config.currency}")
+
+                if not self.bot_running:
+                    break
+
+            # Обновляем dashboard после логина и определения валют
+            if self.bot_running:
+                self.after(0, self._update_dashboard_stats)
+                self._log("✅ Dashboard обновлен с балансами")
 
             # Главный цикл
             cycle_count = 0
@@ -1716,12 +2210,22 @@ class TradingBotGUI(ctk.CTk):
                     if not self.bot_running:
                         break
 
+                    # Skip if account is not logged in
+                    if not account.is_logged_in():
+                        self._log(f"[{account.name}] ⚠️ Пропущено (не залогинен)")
+                        continue
+
                     try:
+                        from src.async_helper import run_async_in_gui
+
                         bot = TradingBot(account)
-                        stats = bot.run_cycle()
+                        # Торговый цикл может занять несколько минут, устанавливаем таймаут 5 минут
+                        stats = run_async_in_gui(bot.run_cycle(), timeout=300.0)
 
                         self._log(
                             f"[{account.name}] Цикл завершен: "
+                            f"отменено={stats.get('orders_cancelled', 0)}, "
+                            f"активно={stats.get('orders_synced', 0)}, "
                             f"создано={stats['orders_created']}, "
                             f"исполнено={stats['orders_filled']}, "
                             f"выставлено={stats['items_listed']}"
@@ -1753,42 +2257,101 @@ class TradingBotGUI(ctk.CTk):
         """Обновить данные на всех вкладках."""
         try:
             # Обновляем статистику
-            self._update_dashboard_stats()
+            selected_account = self.account_selector.get() if hasattr(self, 'account_selector') else "Все аккаунты"
+            self._update_dashboard_stats(selected_account)
             self._update_accounts_balances()
             self._refresh_orders_list()
             self._refresh_inventory_list()
             self._refresh_profitable_items()
 
+            # Обновляем таблицы на Dashboard
+            self._refresh_recent_trades()
+            self._refresh_active_orders_table()
+
         except Exception as e:
             logger.error(f"Error refreshing data: {e}")
 
-    def _update_dashboard_stats(self):
-        """Обновить статистику на Dashboard."""
+    def _update_dashboard_stats(self, account_name: str = "Все аккаунты"):
+        """
+        Обновить статистику на Dashboard для выбранного аккаунта.
+
+        Args:
+            account_name: Имя аккаунта или "Все аккаунты"
+        """
         try:
             # Балансы
             total_steam = 0.0
             total_csgotm = 0.0
+            currency = "RUB"
 
             if self.account_manager:
                 try:
-                    balances = self.account_manager.get_total_balance()
-                    total_steam = balances.get('steam_balance', 0.0)
-                    total_csgotm = balances.get('csgotm_balance', 0.0)
+                    if account_name == "Все аккаунты":
+                        # Суммировать по всем аккаунтам
+                        # get_total_balance_sync() возвращает балансы в RUB (с конвертацией)
+                        currency = "RUB"  # Всегда RUB для "Все аккаунты"
+
+                        balances = self.account_manager.get_total_balance_sync()
+                        total_steam = balances.get('steam_balance', 0.0)
+                        total_csgotm = balances.get('csgotm_balance', 0.0)
+                    else:
+                        # Баланс конкретного аккаунта
+                        account = next((acc for acc in self.account_manager.accounts if acc.name == account_name), None)
+                        if account:
+                            total_steam = account.get_wallet_balance_sync()
+                            total_csgotm = account.get_csgotm_balance()
+                            currency = getattr(account.config, 'currency', 'RUB')
                 except Exception as e:
                     logger.error(f"Error getting balances: {e}")
 
+            # Конвертируем CSGO.TM баланс если валюта не RUB (CSGO.TM всегда возвращает RUB)
+            display_csgotm = total_csgotm
+            if currency != "RUB" and total_csgotm > 0:
+                display_csgotm = currency_converter.convert_from_rub(total_csgotm, currency)
+
             self.stats_cards['balance_steam'].value_label.configure(
-                text=f"{total_steam:.2f} RUB"
+                text=f"{total_steam:.2f} {currency}"
             )
             self.stats_cards['balance_csgotm'].value_label.configure(
-                text=f"{total_csgotm:.2f} RUB"
+                text=f"{display_csgotm:.2f} {currency}" + (f" ({total_csgotm:.2f} RUB)" if currency != "RUB" and total_csgotm > 0 else "")
             )
 
             # Статистика из БД
-            active_orders = trades_db.get_active_orders_count()
-            on_hold = trades_db.get_purchased_items_count()
-            profit_data = trades_db.get_total_profit()
-            sold_count = trades_db.get_sold_items_count()
+            # Проверяем, поддерживают ли методы фильтрацию по account_name
+            try:
+                if account_name == "Все аккаунты":
+                    active_orders = trades_db.get_active_orders_count()
+                    on_hold = trades_db.get_purchased_items_count()
+                    profit_data = trades_db.get_total_profit()
+                    sold_count = trades_db.get_sold_items_count()
+                else:
+                    # Пробуем передать account_name (если метод поддерживает)
+                    try:
+                        active_orders = trades_db.get_active_orders_count(account_name=account_name)
+                    except TypeError:
+                        # Метод не поддерживает account_name, используем общий подсчет
+                        active_orders = trades_db.get_active_orders_count()
+
+                    try:
+                        on_hold = trades_db.get_purchased_items_count(account_name=account_name)
+                    except TypeError:
+                        on_hold = trades_db.get_purchased_items_count()
+
+                    try:
+                        profit_data = trades_db.get_total_profit(account_name=account_name)
+                    except TypeError:
+                        profit_data = trades_db.get_total_profit()
+
+                    try:
+                        sold_count = trades_db.get_sold_items_count(account_name=account_name)
+                    except TypeError:
+                        sold_count = trades_db.get_sold_items_count()
+            except Exception as e:
+                logger.error(f"Error getting DB stats: {e}")
+                active_orders = 0
+                on_hold = 0
+                profit_data = {}
+                sold_count = 0
 
             total_profit = profit_data.get('total_profit', 0.0) if profit_data else 0.0
 
@@ -1809,21 +2372,39 @@ class TradingBotGUI(ctk.CTk):
             for account in self.account_manager.accounts:
                 if account.name in self.account_balance_labels:
                     try:
-                        # Получаем баланс аккаунта
-                        steam_balance = account.get_wallet_balance()
-                        csgotm_balance = account.get_csgotm_balance()  # Всегда в RUB
+                        # Проверяем, есть ли кешированный баланс
+                        steam_balance = 0.0
+                        if hasattr(account, '_cached_steam_balance') and account._cached_steam_balance:
+                            # Используем кешированный баланс (чтобы не делать лишние запросы к Steam API)
+                            steam_balance = account._cached_steam_balance.get('balance', 0.0)
+                            currency = account._cached_steam_balance.get('currency', 'RUB')
+                        else:
+                            # Если кеша нет, используем валюту из конфига, но НЕ запрашиваем баланс
+                            # Баланс будет показан только после нажатия "Определить валюту"
+                            currency = getattr(account.config, 'currency', 'RUB')
+                            steam_balance = 0.0
 
-                        # Валюта аккаунта
-                        currency = getattr(account.config, 'currency', 'RUB')
+                        # Получаем баланс CSGO.TM (это быстро и не вызывает rate limit)
+                        try:
+                            csgotm_balance = account.get_csgotm_balance()  # Всегда в RUB
+                        except Exception as e:
+                            logger.warning(f"Failed to get CSGO.TM balance for {account.name}: {e}")
+                            csgotm_balance = 0.0
 
                         # Если валюта не RUB, конвертируем TM баланс
                         if currency != 'RUB':
                             # Steam баланс уже в нужной валюте
                             # TM баланс в RUB -> конвертируем в валюту аккаунта
                             csgotm_converted = currency_converter.convert_from_rub(csgotm_balance, currency)
-                            balance_text = f"💰 Steam: {steam_balance:.2f} {currency} | TM: {csgotm_converted:.2f} {currency} ({csgotm_balance:.2f} RUB)"
+                            if steam_balance > 0:
+                                balance_text = f"💰 Steam: {steam_balance:.2f} {currency} | TM: {csgotm_converted:.2f} {currency} ({csgotm_balance:.2f} RUB)"
+                            else:
+                                balance_text = f"💰 Steam: нажмите '🔍 Валюта' | TM: {csgotm_converted:.2f} {currency} ({csgotm_balance:.2f} RUB)"
                         else:
-                            balance_text = f"💰 Steam: {steam_balance:.2f} {currency} | TM: {csgotm_balance:.2f} {currency}"
+                            if steam_balance > 0:
+                                balance_text = f"💰 Steam: {steam_balance:.2f} {currency} | TM: {csgotm_balance:.2f} {currency}"
+                            else:
+                                balance_text = f"💰 Steam: нажмите '🔍 Валюта' | TM: {csgotm_balance:.2f} {currency}"
 
                         self.account_balance_labels[account.name].configure(text=balance_text)
 
@@ -1910,65 +2491,249 @@ class TradingBotGUI(ctk.CTk):
             widget.destroy()
 
         try:
-            # Получаем предметы на холде
-            items = trades_db.get_items_on_hold()
+            # Получаем фильтр по аккаунту
+            account_filter = None
+            if hasattr(self, 'inventory_account_filter'):
+                selected = self.inventory_account_filter.get()
+                if selected != "Все аккаунты":
+                    account_filter = selected
+
+            # Получаем все предметы (не только на холде)
+            items = trades_db.get_all_purchased_items(account_name=account_filter)
 
             if not items:
                 label = ctk.CTkLabel(
                     self.inventory_scrollable,
-                    text="Нет предметов на холде",
+                    text="Нет предметов",
                     font=ctk.CTkFont(size=14)
                 )
                 label.pack(pady=20)
                 return
 
+            # Фиксированные ширины колонок: Аккаунт, Предмет, Куплен за, CSGO.TM, Профит ₽, Разблокировка
+            col_widths = [110, 450, 100, 100, 100, 160]
+
             # Создаем заголовок
-            header = ctk.CTkFrame(self.inventory_scrollable)
-            header.pack(fill="x", pady=(0, 5))
+            header = ctk.CTkFrame(self.inventory_scrollable, fg_color=COLORS["bg_secondary"])
+            header.pack(fill="x", pady=(0, 2))
 
-            # Настраиваем grid для адаптивной ширины
-            header.grid_columnconfigure(0, weight=1, minsize=150)  # Аккаунт
-            header.grid_columnconfigure(1, weight=4, minsize=350)  # Предмет
-            header.grid_columnconfigure(2, weight=1, minsize=150)  # Куплен
-            header.grid_columnconfigure(3, weight=1, minsize=150)  # Разблокировка
-
-            headers = ["Аккаунт", "Предмет", "Куплен", "Разблокировка"]
+            headers = ["Аккаунт", "Предмет", "Куплен за", "CSGO.TM", "Профит ₽", "Разблокировка"]
             for i, text in enumerate(headers):
-                label = ctk.CTkLabel(
+                ctk.CTkLabel(
                     header,
                     text=text,
+                    width=col_widths[i],
+                    anchor="w",
                     font=ctk.CTkFont(size=14, weight="bold")
-                )
-                label.grid(row=0, column=i, padx=10, pady=8, sticky="ew")
+                ).pack(side="left", padx=5, pady=6)
 
             # Добавляем предметы
             for item in items:
-                row = ctk.CTkFrame(self.inventory_scrollable)
-                row.pack(fill="x", pady=3)
+                row = ctk.CTkFrame(self.inventory_scrollable, fg_color=COLORS["bg_tertiary"], corner_radius=3)
+                row.pack(fill="x", pady=1)
 
-                # Настраиваем grid для строки
-                row.grid_columnconfigure(0, weight=1, minsize=150)
-                row.grid_columnconfigure(1, weight=4, minsize=350)
-                row.grid_columnconfigure(2, weight=1, minsize=150)
-                row.grid_columnconfigure(3, weight=1, minsize=150)
+                # Аккаунт
+                ctk.CTkLabel(
+                    row,
+                    text=item.get('account_name', 'N/A'),
+                    width=col_widths[0],
+                    anchor="w",
+                    font=ctk.CTkFont(size=13)
+                ).pack(side="left", padx=5, pady=4)
 
-                values = [
-                    item.get('account_name', 'N/A'),
-                    item.get('item_name', 'N/A'),
-                    item.get('purchase_date', 'N/A')[:16],
-                    item.get('unlock_date', 'N/A')[:16]
-                ]
+                # Предмет (кликабельная ссылка)
+                item_name = item.get('item_name', 'N/A')
+                market_hash_name = item.get('market_hash_name', '')
+                # Обрезаем длинные названия
+                display_name = item_name[:55] + "..." if len(item_name) > 58 else item_name
 
-                for i, value in enumerate(values):
-                    label = ctk.CTkLabel(
-                        row,
-                        text=value,
-                        font=ctk.CTkFont(size=13)
+                item_frame = ctk.CTkFrame(row, fg_color="transparent", width=col_widths[1], height=24)
+                item_frame.pack(side="left", padx=5, pady=4)
+                item_frame.pack_propagate(False)
+
+                item_label = ctk.CTkLabel(
+                    item_frame,
+                    text=display_name,
+                    anchor="w",
+                    font=ctk.CTkFont(size=13),
+                    text_color="#3498db",
+                    cursor="hand2"
+                )
+                item_label.pack(side="left")
+
+                if market_hash_name:
+                    from urllib.parse import quote
+                    steam_url = f"https://steamcommunity.com/market/listings/730/{quote(market_hash_name)}"
+                    item_label.bind("<Button-1>", lambda e, url=steam_url: self._open_url(url))
+
+                    # CSGO.TM link
+                    csgotm_label = ctk.CTkLabel(
+                        item_frame,
+                        text="[TM]",
+                        font=ctk.CTkFont(size=11),
+                        text_color="#e74c3c",
+                        cursor="hand2"
                     )
-                    label.grid(row=0, column=i, padx=10, pady=6, sticky="ew")
+                    csgotm_label.pack(side="left", padx=(3, 0))
+
+                    # Определяем категорию оружия
+                    weapon_categories = {
+                        'AK-47': 'Rifle/AK-47', 'M4A4': 'Rifle/M4A4', 'M4A1-S': 'Rifle/M4A1-S',
+                        'AWP': 'Rifle/AWP', 'USP-S': 'Pistol/USP-S', 'Glock-18': 'Pistol/Glock-18',
+                        'Desert Eagle': 'Pistol/Desert%20Eagle', 'P250': 'Pistol/P250',
+                        'Five-SeveN': 'Pistol/Five-SeveN', 'Tec-9': 'Pistol/Tec-9',
+                        'MP9': 'SMG/MP9', 'MAC-10': 'SMG/MAC-10', 'UMP-45': 'SMG/UMP-45',
+                        'P90': 'SMG/P90', 'MP7': 'SMG/MP7', 'MP5-SD': 'SMG/MP5-SD',
+                        'FAMAS': 'Rifle/FAMAS', 'Galil AR': 'Rifle/Galil%20AR',
+                        'SSG 08': 'Rifle/SSG%2008', 'SG 553': 'Rifle/SG%20553',
+                        'AUG': 'Rifle/AUG', 'G3SG1': 'Rifle/G3SG1', 'SCAR-20': 'Rifle/SCAR-20',
+                        'Nova': 'Shotgun/Nova', 'XM1014': 'Shotgun/XM1014', 'MAG-7': 'Shotgun/MAG-7',
+                        'Sawed-Off': 'Shotgun/Sawed-Off', 'M249': 'Machinegun/M249',
+                        'Negev': 'Machinegun/Negev', 'CZ75-Auto': 'Pistol/CZ75-Auto',
+                        'R8 Revolver': 'Pistol/R8%20Revolver', 'Dual Berettas': 'Pistol/Dual%20Berettas',
+                    }
+                    weapon_path = ''
+                    for weapon, path in weapon_categories.items():
+                        if weapon in market_hash_name:
+                            weapon_path = path
+                            break
+                    if weapon_path:
+                        csgotm_url = f"https://market.csgo.com/ru/{weapon_path}/{quote(market_hash_name)}"
+                    else:
+                        csgotm_url = f"https://market.csgo.com/ru/?search={quote(market_hash_name)}"
+                    csgotm_label.bind("<Button-1>", lambda e, url=csgotm_url: self._open_url(url))
+
+                # Цена покупки
+                purchase_price = item.get('purchase_price', 0)
+                ctk.CTkLabel(
+                    row,
+                    text=f"{purchase_price:.0f} ₽",
+                    width=col_widths[2],
+                    anchor="w",
+                    font=ctk.CTkFont(size=13)
+                ).pack(side="left", padx=5, pady=4)
+
+                # CSGO.TM Price (текущая)
+                current_csgotm = item.get('current_csgotm_price')
+                csgotm_text = f"{current_csgotm:.0f} ₽" if current_csgotm else "—"
+                ctk.CTkLabel(
+                    row,
+                    text=csgotm_text,
+                    width=col_widths[3],
+                    anchor="w",
+                    font=ctk.CTkFont(size=13),
+                    text_color="#e74c3c" if current_csgotm else None
+                ).pack(side="left", padx=5, pady=4)
+
+                # Профит в рублях (CSGO.TM - цена покупки)
+                if current_csgotm and purchase_price:
+                    profit_rub = current_csgotm - purchase_price
+                    profit_color = "#27ae60" if profit_rub > 0 else "#e74c3c"
+                    profit_text = f"{profit_rub:+.0f} ₽"
+                else:
+                    profit_color = None
+                    profit_text = "—"
+
+                ctk.CTkLabel(
+                    row,
+                    text=profit_text,
+                    width=col_widths[4],
+                    anchor="w",
+                    font=ctk.CTkFont(size=13, weight="bold" if current_csgotm else "normal"),
+                    text_color=profit_color
+                ).pack(side="left", padx=5, pady=4)
+
+                # Разблокировка - форматируем как в Steam (8:00 GMT)
+                unlock_date = item.get('unlock_date', 'N/A')
+                if unlock_date and unlock_date != 'N/A':
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(unlock_date.replace(' ', 'T')[:19])
+                        unlock_text = dt.strftime('%Y-%m-%d 08:00')
+                    except Exception:
+                        unlock_text = unlock_date[:16] if len(unlock_date) > 16 else unlock_date
+                else:
+                    unlock_text = 'N/A'
+
+                ctk.CTkLabel(
+                    row,
+                    text=unlock_text,
+                    width=col_widths[5],
+                    anchor="w",
+                    font=ctk.CTkFont(size=13)
+                ).pack(side="left", padx=5, pady=4)
 
         except Exception as e:
             logger.error(f"Error refreshing inventory: {e}")
+
+    def _open_url(self, url: str):
+        """Открыть URL в браузере."""
+        import webbrowser
+        webbrowser.open(url)
+
+    def _refresh_item_prices(self):
+        """Обновить текущие цены CSGO.TM для всех предметов в инвентаре."""
+        import threading
+
+        def update_prices():
+            try:
+                self._log("🔄 Обновление цен CSGO.TM для предметов на холде...")
+
+                # Получаем все предметы
+                items = trades_db.get_all_purchased_items()
+                if not items:
+                    self._log("Нет предметов для обновления")
+                    return
+
+                # Получаем CSGO.TM клиент из первого активного аккаунта
+                csgotm_client = None
+                if self.account_manager:
+                    for account in self.account_manager.get_enabled_accounts():
+                        if account.csgotm_client:
+                            csgotm_client = account.csgotm_client
+                            break
+
+                if not csgotm_client:
+                    self._log("❌ CSGO.TM клиент не найден. Авторизуйтесь в аккаунте.")
+                    return
+
+                updated = 0
+                for item in items:
+                    market_hash_name = item.get('market_hash_name', '')
+                    if not market_hash_name:
+                        continue
+
+                    try:
+                        # Получаем цену с CSGO.TM
+                        price_info = csgotm_client.get_item_price(market_hash_name)
+                        if price_info and 'min_price' in price_info:
+                            csgotm_price = price_info['min_price']
+
+                            # Обновляем в БД
+                            trades_db.update_item_current_prices(
+                                item['id'],
+                                current_csgotm_price=csgotm_price
+                            )
+                            updated += 1
+                            self._log(f"✅ {market_hash_name[:40]}: {csgotm_price:.0f} ₽")
+
+                        import time
+                        time.sleep(0.5)  # Rate limiting
+
+                    except Exception as e:
+                        self._log(f"⚠️ Ошибка для {market_hash_name[:30]}: {e}")
+
+                self._log(f"✅ Обновлено цен: {updated}/{len(items)}")
+
+                # Обновляем таблицу в GUI
+                self.after(100, self._refresh_inventory_list)
+
+            except Exception as e:
+                self._log(f"❌ Ошибка обновления цен: {e}")
+
+        # Запускаем в отдельном потоке
+        thread = threading.Thread(target=update_prices, daemon=True)
+        thread.start()
 
     def _toggle_profit_sort(self):
         """Переключить сортировку по профиту."""
@@ -1977,9 +2742,15 @@ class TradingBotGUI(ctk.CTk):
 
     def _refresh_profitable_items(self):
         """Обновить список выгодных предметов из БД."""
-        # Очищаем
-        for widget in self.parser_scrollable.winfo_children():
-            widget.destroy()
+        # Очищаем (с защитой от ошибок при удалении виджетов)
+        try:
+            for widget in self.parser_scrollable.winfo_children():
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass  # Виджет уже удален или недоступен
+        except Exception:
+            pass
 
         try:
             # Определяем фильтр по профиту
@@ -2040,7 +2811,7 @@ class TradingBotGUI(ctk.CTk):
             header = ctk.CTkFrame(self.parser_scrollable)
             header.pack(fill="x", pady=(0, 5))
 
-            headers = ["Предмет", "Steam Buy", "CSGO Sell", "Профит %", "Рек. цена", "Обновлено", "Действия"]
+            headers = ["Предмет", "Steam Buy", "CSGO Sell (мин.)", "Профит %", "Рек. цена", "Обновлено", "Действия"]
             # Используем grid weights для адаптивной ширины
             header.grid_columnconfigure(0, weight=4, minsize=350)  # Название предмета - самая широкая
             header.grid_columnconfigure(1, weight=1, minsize=100)  # Steam Buy
@@ -2097,7 +2868,7 @@ class TradingBotGUI(ctk.CTk):
                 # Цвет в зависимости от профита (обрабатываем None)
                 if best_profit is None:
                     best_profit = 0
-                profit_color = "green" if best_profit >= 5 else "orange" if best_profit >= 0 else "red"
+                profit_color = COLORS["accent_green"] if best_profit >= 5 else COLORS["accent_yellow"] if best_profit >= 0 else COLORS["accent_red"]
 
                 # Название предмета (только отображение)
                 item_label = ctk.CTkLabel(
@@ -2114,9 +2885,11 @@ class TradingBotGUI(ctk.CTk):
                     encoded_name = name.replace(' ', '%20').replace('|', '%7C')
                     webbrowser.open(f"https://steamcommunity.com/market/listings/730/{encoded_name}")
 
+                # Обработка None значений для steam_buy_order
+                steam_price = item.get('steam_buy_order') or 0
                 steam_btn = ctk.CTkButton(
                     row,
-                    text=f"{item.get('steam_buy_order', 0):.2f} ₽",
+                    text=f"{steam_price:.2f} ₽",
                     command=open_steam,
                     fg_color="transparent",
                     hover_color=("gray70", "gray30"),
@@ -2130,9 +2903,11 @@ class TradingBotGUI(ctk.CTk):
                     encoded_name = quote(name)
                     webbrowser.open(f"https://market.csgo.com/ru/{encoded_name}")
 
+                # Обработка None значений для csgo_price
+                csgo_price = item.get('csgo_price') or 0
                 csgo_btn = ctk.CTkButton(
                     row,
-                    text=f"{item.get('csgo_price', 0):.2f} ₽",
+                    text=f"{csgo_price:.2f} ₽",
                     command=open_csgotm,
                     fg_color="transparent",
                     hover_color=("gray70", "gray30"),
@@ -2149,8 +2924,8 @@ class TradingBotGUI(ctk.CTk):
                 )
                 profit_label.grid(row=0, column=3, padx=8, pady=6, sticky="ew")
 
-                # Рекомендованная цена
-                rec_price = item.get('recommended_buy_order', 0)
+                # Рекомендованная цена (обработка None)
+                rec_price = item.get('recommended_buy_order') or 0
                 rec_label = ctk.CTkLabel(
                     row,
                     text=f"{rec_price:.2f} ₽",
@@ -2248,134 +3023,87 @@ class TradingBotGUI(ctk.CTk):
 
     def _update_item_thread(self, market_hash_name: str):
         """Поток для обновления одного предмета."""
+        import asyncio
+
         try:
-            from src.steam_client import SteamClient
+            asyncio.run(self._update_item_async(market_hash_name))
+        except Exception as e:
+            logger.error(f"Error in update item thread: {e}", exc_info=True)
+            self._log(f"Ошибка обновления: {e}")
+            self._update_scanner_status("Готов", "green")
+
+    async def _update_item_async(self, market_hash_name: str):
+        """Async update single item using aiosteampy."""
+        try:
             from src.csgotm_client import CsgoTmClient
-            import requests
             import os
 
-            # Получаем минимальный профит из конфига (используем self.bot_config напрямую)
-            min_profit = self.bot_config.get('min_profit_percent', 15)
+            # Get logged in account
+            account = None
+            if self.account_manager and len(self.account_manager.accounts) > 0:
+                account = self.account_manager.accounts[0]
+                if not account.is_logged_in():
+                    self._log(f"⚠️ Аккаунт не залогинен")
+                    self._update_scanner_status("Готов", "green")
+                    return
 
-            # Загружаем прокси если есть
-            proxy_file = self.bot_config.get('proxy_file', 'proxies.txt')
-            proxies_list = self._load_proxies(proxy_file)
-
-            # Попробуем несколько прокси, если первый не работает
-            histogram = None
-            steam_buy_order = None
-            csgo_price = None
-            max_proxy_attempts = min(3, len(proxies_list)) if proxies_list else 1
-
-            for attempt in range(max_proxy_attempts if proxies_list else 1):
-                session = None
-                if proxies_list:
-                    # Используем случайный прокси
-                    import random
-                    proxy = random.choice(proxies_list)
-                    self._log(f"Используем прокси для обхода rate limit: {proxy.split('@')[-1] if '@' in proxy else proxy}")
-
-                    # Создаём сессию с прокси
-                    session = requests.Session()
-                    session.proxies = {'http': proxy, 'https': proxy}
-                else:
-                    # Создаём обычную сессию если нет прокси
-                    self._log(f"ℹ️ Работаем без прокси (возможны ограничения по rate limit)")
-                    session = requests.Session()
-
-                # Создаём клиенты напрямую
-                steam_client = SteamClient()
-
-                # КРИТИЧЕСКИ ВАЖНО: Устанавливаем сессию ДО любых запросов!
-                # Иначе _make_public_request создаст новую сессию без прокси
-                steam_client._session = session
-
-                # Уменьшаем задержку и retry для быстрой проверки прокси
-                steam_client.REQUEST_DELAY = 0.5 if proxies_list else 1.0
-                steam_client.MAX_RETRIES = 2  # Только 2 попытки для быстрой проверки
-
-                csgotm_api_key = os.getenv('CSGOTM_API_KEY', self.bot_config.get('csgo_tm_api_key', ''))
-                csgotm_client = CsgoTmClient(api_key=csgotm_api_key, session=session)
-
-                self._log(f"Запрос цены на Steam Market...")
-
-                try:
-                    # Получаем текущую цену buy order на Steam
-                    histogram = steam_client.get_market_histogram(market_hash_name)
-                    if not histogram or not histogram.get('highest_buy_order'):
-                        if proxies_list:
-                            self._log(f"Не удалось получить данные через этот прокси")
-                            if attempt < max_proxy_attempts - 1:
-                                self._log(f"Пробуем другой прокси...")
-                                continue
-                        else:
-                            self._log(f"Не удалось получить данные")
-                        break
-
-                    steam_buy_order = histogram['highest_buy_order']
-                    steam_lowest_sell = histogram.get('lowest_sell_order')
-                    self._log(f"Steam buy order: {steam_buy_order:.2f} RUB")
-
-                    # Проверка на фейк-профит
-                    if steam_lowest_sell and steam_buy_order >= steam_lowest_sell:
-                        self._log(f"❌ ФЕЙК ПРОФИТ! Buy order ({steam_buy_order:.2f}) >= Lowest sell ({steam_lowest_sell:.2f})")
-                        self._log(f"Предмет {market_hash_name} удалён из списка")
-                        trades_db.mark_items_inactive([market_hash_name])
-                        self._update_scanner_status("Готов", "green")
-                        # Обновляем отображение
-                        self.after(0, self._refresh_profitable_items)
-                        return
-
-                    # Получаем цену CSGO.TM (используем ту же сессию, пока она открыта)
-                    self._log(f"Запрос цены на CSGO.TM...")
-                    tm_price_data = csgotm_client.get_item_price(market_hash_name)
-                    if not tm_price_data or 'min_price' not in tm_price_data:
-                        self._log(f"Не удалось получить цену CSGO.TM для {market_hash_name}")
-                        self._update_scanner_status("Готов", "green")
-                        return
-
-                    csgo_price = tm_price_data['min_price']
-                    self._log(f"CSGO.TM price: {csgo_price:.2f} RUB")
-
-                    # Успешно получили все данные - прерываем цикл
-                    break
-
-                except Exception as e:
-                    if proxies_list:
-                        self._log(f"Ошибка с прокси: {str(e)[:100]}")
-                        if attempt < max_proxy_attempts - 1:
-                            self._log(f"Пробуем другой прокси...")
-                            continue
-                    else:
-                        self._log(f"Ошибка запроса: {str(e)[:100]}")
-                finally:
-                    # Закрываем сессию перед следующей попыткой
-                    if session and hasattr(session, 'close'):
-                        try:
-                            session.close()
-                        except:
-                            pass
-
-            if not histogram or not histogram.get('highest_buy_order') or not csgo_price:
-                self._log(f"Не удалось получить цены для {market_hash_name}")
-                if not proxies_list:
-                    self._log(f"Совет: Добавьте прокси в файл {proxy_file} для обхода блокировки")
+            if not account:
+                self._log(f"⚠️ Нет залогиненного аккаунта")
                 self._update_scanner_status("Готов", "green")
                 return
 
-            # Рассчитываем профит (с учетом комиссии 7% на CSGO.TM)
+            steam_client = account.steam_client
+            csgotm_client = account.csgotm_client
+
+            # Get min profit from config
+            min_profit = self.bot_config.get('min_profit_percent', 15)
+
+            self._log(f"Запрос цены на Steam Market...")
+
+            # Get current Steam price using aiosteampy
+            histogram = await steam_client.get_item_histogram(market_hash_name)
+            if not histogram or not histogram.get('highest_buy_order'):
+                self._log(f"Не удалось получить данные Steam")
+                self._update_scanner_status("Готов", "green")
+                return
+
+            steam_buy_order = histogram['highest_buy_order']
+            steam_lowest_sell = histogram.get('lowest_sell_order')
+            self._log(f"Steam buy order: {steam_buy_order:.2f} RUB")
+
+            # Check for fake profit
+            if steam_lowest_sell and steam_buy_order >= steam_lowest_sell:
+                self._log(f"❌ ФЕЙК ПРОФИТ! Buy order ({steam_buy_order:.2f}) >= Lowest sell ({steam_lowest_sell:.2f})")
+                self._log(f"Предмет {market_hash_name} удалён из списка")
+                trades_db.mark_items_inactive([market_hash_name])
+                self._update_scanner_status("Готов", "green")
+                self.after(0, self._refresh_profitable_items)
+                return
+
+            # Get CSGO.TM price
+            self._log(f"Запрос цены на CSGO.TM...")
+            tm_price_data = csgotm_client.get_item_price(market_hash_name)
+            if not tm_price_data or 'min_price' not in tm_price_data:
+                self._log(f"Не удалось получить цену CSGO.TM для {market_hash_name}")
+                self._update_scanner_status("Готов", "green")
+                return
+
+            csgo_price = tm_price_data['min_price']
+            self._log(f"CSGO.TM price: {csgo_price:.2f} RUB")
+
+            # Calculate profit (with 7% commission on CSGO.TM)
             net_revenue = csgo_price * 0.93
             if steam_buy_order > 0:
                 instant_profit_pct = ((net_revenue - steam_buy_order) / steam_buy_order) * 100
             else:
                 instant_profit_pct = 0
 
-            # Рекомендуемая цена для покупки (на 1 копейку выше текущего максимума)
+            # Recommended buy order price
             recommended_buy_order = steam_buy_order + 0.01
 
-            # Проверяем, выгоден ли предмет
+            # Check if still profitable
             if instant_profit_pct >= min_profit:
-                # Обновляем в БД
+                # Update in DB
                 trades_db.add_profitable_item(
                     market_hash_name=market_hash_name,
                     item_type='weapon',
@@ -2384,7 +3112,7 @@ class TradingBotGUI(ctk.CTk):
                     csgo_price=csgo_price,
                     csgo_buy_order=0,
                     instant_profit_pct=instant_profit_pct,
-                    wait_profit_pct=instant_profit_pct,  # Упрощённо, без учета ожидания
+                    wait_profit_pct=instant_profit_pct,
                     recommended_instant_pct=instant_profit_pct,
                     recommended_wait_pct=instant_profit_pct,
                     orders_above=0
@@ -2393,12 +3121,12 @@ class TradingBotGUI(ctk.CTk):
             else:
                 self._log(f"Предмет больше не выгоден: {market_hash_name} (профит: {instant_profit_pct:.2f}% < {min_profit}%)")
 
-            # Обновляем отображение
+            # Update display
             self.after(0, self._refresh_profitable_items)
             self._update_scanner_status("Готов", "green")
 
         except Exception as e:
-            logger.error(f"Error in update item thread: {e}", exc_info=True)
+            logger.error(f"Error updating item: {e}", exc_info=True)
             self._log(f"Ошибка обновления: {e}")
             self._update_scanner_status("Готов", "green")
 
@@ -2501,64 +3229,85 @@ class TradingBotGUI(ctk.CTk):
 
     def _rescan_items_thread(self, items: list[dict]):
         """Thread function for rescanning items."""
+        import asyncio
+
+        # Run async function in this thread
         try:
-            from src.steam_client import SteamClient
+            asyncio.run(self._rescan_items_async(items))
+        except Exception as e:
+            logger.error(f"Rescan thread error: {e}", exc_info=True)
+            self._log(f"❌ Ошибка пересканирования: {e}")
+            self._update_scanner_status("Статус: ошибка", "red")
+        finally:
+            self.scanner_running = False
+
+    async def _rescan_items_async(self, items: list[dict]):
+        """Async rescan implementation using aiosteampy."""
+        try:
             from src.csgotm_client import CsgoTmClient
-            import requests
-            import random
+            from src.steam_client_aiosteampy import SteamClientAio
             import os
 
-            # Загружаем прокси
-            proxy_file = self.bot_config.get('proxy_file', 'proxies.txt')
-            proxies_list = self._load_proxies(proxy_file)
-
-            # Try to use existing logged-in account if available
-            steam_client = None
-            csgotm_client = None
-            account_currency = None
-
+            # Получаем конфиг первого аккаунта
+            account = None
             if self.account_manager and len(self.account_manager.accounts) > 0:
                 account = self.account_manager.accounts[0]
 
-                # Try to login if not logged in
-                if not account.is_logged_in():
-                    self._log(f"⚠️ Аккаунт {account.name} не залогинен, попытка входа...")
-                    try:
-                        if account.login():
-                            self._log(f"✅ Успешный вход в аккаунт {account.name}")
-                        else:
-                            self._log(f"⚠️ Не удалось войти в аккаунт {account.name}")
-                    except Exception as e:
-                        self._log(f"⚠️ Ошибка входа: {e}")
+            if not account:
+                self._log(f"⚠️ Нет аккаунтов для пересканирования")
+                self._update_scanner_status("Статус: ошибка", "red")
+                return
 
-                # Use account's client if logged in
-                if account.is_logged_in():
-                    steam_client = account.steam_client
-                    csgotm_client = account.csgotm_client
-                    account_currency = account.config.currency
-                    self._log(f"✅ Используем аккаунт {account.name}, валюта: {account_currency}")
+            account_currency = account.config.currency
 
-            # If no logged-in account, create clients without auth (for public price checks)
-            # Create with proxy support
-            if not steam_client:
-                self._log(f"⚠️ Нет залогиненного аккаунта, используем публичный доступ (валюта: RUB по умолчанию)")
-                steam_client = SteamClient()
-                # Set proxy session if available
-                if proxies_list:
-                    proxy = random.choice(proxies_list)
-                    session = requests.Session()
-                    session.proxies = {'http': proxy, 'https': proxy}
-                    steam_client._session = session
-                    steam_client.REQUEST_DELAY = 0.5
-                    self._log(f"ℹ️ Используем прокси для пересканирования")
-                else:
-                    self._log(f"ℹ️ Пересканирование без прокси (возможны ограничения)")
+            # Cookies хранятся в data/cookies/
+            cookies_file = f"data/cookies/{account.name}_aio.json"
 
+            if not os.path.exists(cookies_file):
+                self._log(f"⚠️ Нет файла cookies: {cookies_file}")
+                self._update_scanner_status("Статус: ошибка", "red")
+                return
+
+            self._log(f"🔄 Создаём новый Steam клиент для пересканирования...")
+
+            # Получаем URL прокси из конфига
+            proxy_url = None
+            if account.config.proxy and account.config.proxy.enabled and account.config.proxy.url:
+                proxy_url = account.config.proxy.url
+
+            # Создаём НОВЫЙ SteamClient в текущем event loop
+            steam_client = SteamClientAio(
+                account_name=account.name,
+                proxy=proxy_url,
+                cookies_file=cookies_file,
+            )
+
+            # Логинимся с credentials (cookies будут загружены автоматически)
+            success = await steam_client.login(
+                username=account.config.steam_username,
+                password=account.config.steam_password,
+                shared_secret=account.config.steam_shared_secret,
+                identity_secret=account.config.steam_identity_secret,
+                api_key=account.config.steam_api_key,
+                steam_id=account.config.steamid,
+                cookie_file=cookies_file,
+            )
+            if success:
+                self._log(f"✅ Steam клиент готов, валюта: {account_currency}")
+            else:
+                self._log(f"⚠️ Не удалось войти в Steam")
+                self._update_scanner_status("Статус: ошибка", "red")
+                return
+
+            # Используем CSGO.TM клиент аккаунта или создаём новый
+            csgotm_client = account.csgotm_client
             if not csgotm_client:
-                # Use same session for CSGO.TM
-                session = steam_client._session if hasattr(steam_client, '_session') else None
-                csgotm_api_key = os.getenv('CSGOTM_API_KEY', self.bot_config.get('csgo_tm_api_key', ''))
-                csgotm_client = CsgoTmClient(api_key=csgotm_api_key, session=session)
+                self._log(f"ℹ️ Создаём CSGO.TM клиент...")
+                csgotm_client = CsgoTmClient(api_key=account.config.csgotm_api_key)
+                if not csgotm_client.ping():
+                    self._log(f"⚠️ CSGO.TM не отвечает")
+                    self._update_scanner_status("Статус: ошибка", "red")
+                    return
 
             still_profitable = 0
             no_longer_profitable = 0
@@ -2569,8 +3318,8 @@ class TradingBotGUI(ctk.CTk):
                     item_name = item['market_hash_name']
                     self._log(f"[{idx}/{len(items)}] Проверка: {item_name}")
 
-                    # Get current Steam price
-                    histogram = steam_client.get_market_histogram(item_name)
+                    # Get current Steam price using aiosteampy
+                    histogram = await steam_client.get_market_histogram(item_name)
                     if not histogram or not histogram.get('highest_buy_order'):
                         self._log(f"  ⚠️ Нет данных Steam")
                         errors += 1
@@ -2628,7 +3377,7 @@ class TradingBotGUI(ctk.CTk):
                         still_profitable += 1
 
                     # Small delay to avoid rate limits
-                    time.sleep(2)
+                    await asyncio.sleep(2)
 
                 except Exception as e:
                     logger.error(f"Error rescanning {item.get('market_hash_name', 'unknown')}: {e}")
@@ -2638,20 +3387,20 @@ class TradingBotGUI(ctk.CTk):
             self._log(f"\n✅ Пересканирование завершено!")
             self._log(f"Актуальны: {still_profitable}, Удалены: {no_longer_profitable}, Ошибки: {errors}")
             self._update_scanner_status("Статус: пересканирование завершено", "green")
-            self._refresh_profitable_items()
+            # Обновление GUI из фонового потока через after()
+            self.after(0, self._refresh_profitable_items)
 
         except Exception as e:
             logger.error(f"Rescan error: {e}", exc_info=True)
             self._log(f"❌ Ошибка пересканирования: {e}")
             self._update_scanner_status("Статус: ошибка", "red")
         finally:
-            # Clean up session
-            if 'steam_client' in locals() and steam_client and hasattr(steam_client, '_session'):
+            # Закрываем созданный клиент
+            if 'steam_client' in locals() and steam_client:
                 try:
-                    steam_client._session.close()
-                except:
+                    await steam_client.close()
+                except Exception:
                     pass
-            self.scanner_running = False
 
     def _scan_new_items(self):
         """Искать только новые предметы (не в БД)."""
@@ -2670,6 +3419,31 @@ class TradingBotGUI(ctk.CTk):
 
         # Store skip list and run normal scanner
         self.skip_existing_items = existing_names
+        self._start_scanner()
+
+    def _scan_new_items_auto(self, max_items: int = 10):
+        """
+        Автоматическое сканирование новых предметов.
+        Вызывается из AutoScanner.
+
+        Args:
+            max_items: Максимальное количество новых предметов для сканирования
+        """
+        if hasattr(self, 'scanner_running') and self.scanner_running:
+            self._log("⚠️ Сканер уже работает, пропускаем автосканирование")
+            return
+
+        self._log(f"🔄 Автосканирование: поиск {max_items} новых предметов...")
+
+        # Get existing items from DB
+        existing_items = trades_db.get_all_profitable_items()
+        existing_names = {item['market_hash_name'] for item in existing_items}
+
+        self._log(f"ℹ️ В базе {len(existing_names)} предметов")
+
+        # Store skip list and max items limit for scanner
+        self.skip_existing_items = existing_names
+        self.auto_scan_max_items = max_items
         self._start_scanner()
 
     def _run_scanner_subprocess(self):
@@ -2734,7 +3508,8 @@ class TradingBotGUI(ctk.CTk):
             if return_code == 0:
                 self._log("✅ Сканирование завершено успешно!")
                 self._update_scanner_status("Статус: завершено", "green")
-                self._refresh_profitable_items()
+                # Обновление GUI из фонового потока через after()
+                self.after(0, self._refresh_profitable_items)
             else:
                 self._log(f"❌ Сканер завершился с ошибкой (код: {return_code})")
                 self._update_scanner_status("Статус: ошибка", "red")
@@ -2835,7 +3610,8 @@ class TradingBotGUI(ctk.CTk):
                         "password": account.config.steam_password,
                         "api_key": account.config.steam_api_key,
                         "shared_secret": account.config.steam_shared_secret,
-                        "identity_secret": account.config.steam_identity_secret
+                        "identity_secret": account.config.steam_identity_secret,
+                        "steamid": account.config.steamid or ""
                     },
                     "csgotm": {
                         "api_key": account.config.csgotm_api_key
@@ -2847,114 +3623,103 @@ class TradingBotGUI(ctk.CTk):
                     }
                 }
 
-                # Добавляем прокси, если есть
+                # Добавляем прокси, если есть (конвертируем объект в dict)
                 if account.config.proxy:
-                    acc_data["proxy"] = account.config.proxy
+                    acc_data["proxy"] = {
+                        "enabled": account.config.proxy.enabled,
+                        "url": account.config.proxy.url or ""
+                    }
+                else:
+                    acc_data["proxy"] = {
+                        "enabled": False,
+                        "url": ""
+                    }
 
                 accounts_data.append(acc_data)
 
-            # Сохраняем в файл с красивым форматированием
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump(accounts_data, f, indent=2, ensure_ascii=False)
+            # Сохраняем в файл с красивым форматированием (атомарная запись)
+            import os
+            import tempfile
+            import shutil
 
-            logger.info(f"Accounts config saved to {config_file}")
+            # Create backup
+            backup_file = str(config_file) + '.backup'
+            if config_file.exists():
+                shutil.copy2(config_file, backup_file)
+
+            # Write to temporary file first
+            temp_fd, temp_path = tempfile.mkstemp(dir=config_file.parent, text=True)
+            try:
+                with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+                    json.dump(accounts_data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Replace original file atomically
+                shutil.move(temp_path, str(config_file))
+                logger.info(f"Accounts config saved to {config_file}")
+
+            except Exception as write_error:
+                # Clean up temp file on error
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+                raise write_error
 
         except Exception as e:
             logger.error(f"Failed to save accounts config: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             self._log(f"❌ Ошибка сохранения конфигурации: {e}")
 
     def _detect_account_currency(self, account):
         """
-        Определить валюту аккаунта автоматически из Steam используя SteamMarketScraper.
+        Определить валюту аккаунта автоматически из Steam.
 
         Args:
             account: Account instance
         """
         def detect_thread():
             try:
-                from src.steam_market_scraper import SteamMarketScraper
-                import json
-                import os
-
                 self._log(f"Определение валюты для аккаунта {account.name}...")
 
-                cookies = None
-
-                # Попытка 1: Читаем cookies из файла steam_cookies.json (как в get_balance.py)
-                if os.path.exists('steam_cookies.json'):
-                    try:
-                        with open('steam_cookies.json', 'r', encoding='utf-8') as f:
-                            cookies = json.load(f)
-                        if cookies and 'sessionid' in cookies:
-                            sessionid_preview = cookies.get('sessionid', '')[:10] + '...'
-                            has_steamlogin = 'YES' if cookies.get('steamLoginSecure') else 'NO'
-                            steam_country = cookies.get('steamCountry', 'N/A')
-                            self._log(f"Используем cookies из steam_cookies.json")
-                            self._log(f"  sessionid={sessionid_preview}, steamLoginSecure={has_steamlogin}, steamCountry={steam_country}")
-                        else:
-                            cookies = None
-                    except Exception as e:
-                        self._log(f"Ошибка чтения steam_cookies.json: {e}")
-                        cookies = None
-
-                # Попытка 2: Получаем cookies из steam_client (если не получили из файла)
-                if not cookies:
-                    self._log(f"Файл steam_cookies.json не найден, пробуем получить из сессии аккаунта...")
-
-                    # Проверяем, залогинен ли аккаунт
-                    if not account.is_logged_in():
-                        self._log(f"Аккаунт {account.name} не залогинен. Попытка входа...")
-                        success = account.login()
-                        if not success:
-                            self._log(f"Не удалось войти в аккаунт {account.name}")
-                            return
-
-                    # Получаем cookies из steam_client
-                    steam_client = account.steam_client
-                    if not steam_client or not steam_client._session:
-                        self._log(f"Нет активной сессии Steam для {account.name}")
+                # Проверяем, залогинен ли аккаунт
+                if not account.is_logged_in():
+                    self._log(f"Аккаунт {account.name} не залогинен. Попытка логина...")
+                    success = account.login_sync()
+                    if not success:
+                        self._log(f"Не удалось залогиниться для {account.name}")
                         return
 
-                    # Формируем cookies для SteamMarketScraper
-                    cookies = {}
-                    for cookie in steam_client._session.cookies:
-                        if cookie.name in ['sessionid', 'steamLoginSecure', 'steamCountry']:
-                            cookies[cookie.name] = cookie.value
+                # Используем новый async метод через sync обертку
+                detected_currency = account.detect_currency_sync()
 
-                    if not cookies.get('sessionid'):
-                        self._log(f"Не найден sessionid в cookies для {account.name}")
-                        return
-
-                    # Логируем cookies для отладки
-                    sessionid_preview = cookies.get('sessionid', '')[:10] + '...' if cookies.get('sessionid') else 'N/A'
-                    has_steamlogin = 'YES' if cookies.get('steamLoginSecure') else 'NO'
-                    steam_country = cookies.get('steamCountry', 'N/A')
-                    self._log(f"Используем cookies из сессии аккаунта")
-                    self._log(f"  sessionid={sessionid_preview}, steamLoginSecure={has_steamlogin}, steamCountry={steam_country}")
-
-                self._log(f"Получение баланса через SteamMarketScraper...")
-
-                # Используем SteamMarketScraper для получения баланса и валюты
-                scraper = SteamMarketScraper(cookies)
-                result = scraper.get_balance()
-
-                if result['success']:
-                    detected_currency = result['currency']
-                    balance = result['balance']
-
-                    self._log(f"Валюта: {detected_currency}, Баланс: {balance} {detected_currency}")
-
-                    # Обновляем валюту в конфигурации аккаунта
-                    account.config.currency = detected_currency
+                if detected_currency:
+                    self._log(f"Валюта для {account.name}: {detected_currency}")
 
                     # Обновляем отображение
                     self.after(0, self._refresh_accounts_list)
 
+                    # Обновляем баланс в GUI
+                    if account.name in self.account_balance_labels:
+                        try:
+                            steam_balance = account.get_wallet_balance_sync()
+                            csgotm_balance = account.get_csgotm_balance()
+
+                            if detected_currency != 'RUB':
+                                from src.currency_converter import currency_converter
+                                csgotm_converted = currency_converter.convert_from_rub(csgotm_balance, detected_currency)
+                                balance_text = f"💰 Steam: {steam_balance:.2f} {detected_currency} | TM: {csgotm_converted:.2f} {detected_currency} ({csgotm_balance:.2f} RUB)"
+                            else:
+                                balance_text = f"💰 Steam: {steam_balance:.2f} {detected_currency} | TM: {csgotm_balance:.2f} {detected_currency}"
+
+                            self.after(0, lambda: self.account_balance_labels[account.name].configure(text=balance_text))
+                        except Exception as e:
+                            logger.error(f"Failed to update balance display: {e}")
+
                     # Сохраняем изменения
                     self._save_accounts_config()
                 else:
-                    error_msg = result.get('error', 'Unknown error')
-                    self._log(f"Не удалось получить баланс: {error_msg}")
+                    self._log(f"Не удалось определить валюту для {account.name}")
 
             except Exception as e:
                 logger.error(f"Error detecting currency for {account.name}: {e}")
@@ -2966,184 +3731,79 @@ class TradingBotGUI(ctk.CTk):
         thread = threading.Thread(target=detect_thread, daemon=True)
         thread.start()
 
+    def _detect_all_currencies(self):
+        """Определить валюту для всех аккаунтов."""
+        if not self.account_manager:
+            self._log("❌ Аккаунты не загружены")
+            return
+
+        def detect_all_thread():
+            try:
+                self._log("🔍 Начинаем определение валюты для всех аккаунтов...")
+
+                for account in self.account_manager.accounts:
+                    if not account.config.enabled:
+                        self._log(f"⏭️ Пропускаем {account.name} (выключен)")
+                        continue
+
+                    self._log(f"Определение валюты для аккаунта {account.name}...")
+
+                    # Проверяем, залогинен ли аккаунт
+                    if not account.is_logged_in():
+                        self._log(f"Аккаунт {account.name} не залогинен. Попытка логина...")
+                        success = account.login_sync()
+                        if not success:
+                            self._log(f"❌ Не удалось залогиниться для {account.name}")
+                            continue
+
+                    # Определяем валюту
+                    detected_currency = account.detect_currency_sync()
+
+                    if detected_currency:
+                        self._log(f"✅ Валюта для {account.name}: {detected_currency}")
+
+                        # Обновляем баланс
+                        try:
+                            steam_balance = account.get_wallet_balance_sync()
+                            csgotm_balance = account.get_csgotm_balance()
+
+                            if detected_currency != 'RUB':
+                                from src.currency_converter import currency_converter
+                                csgotm_converted = currency_converter.convert_from_rub(csgotm_balance, detected_currency)
+                                balance_text = f"💰 Steam: {steam_balance:.2f} {detected_currency} | TM: {csgotm_converted:.2f} {detected_currency} ({csgotm_balance:.2f} RUB)"
+                            else:
+                                balance_text = f"💰 Steam: {steam_balance:.2f} {detected_currency} | TM: {csgotm_balance:.2f} {detected_currency}"
+
+                            if account.name in self.account_balance_labels:
+                                self.after(0, lambda text=balance_text, name=account.name:
+                                    self.account_balance_labels[name].configure(text=text))
+                        except Exception as e:
+                            logger.error(f"Failed to update balance for {account.name}: {e}")
+                    else:
+                        self._log(f"❌ Не удалось определить валюту для {account.name}")
+
+                # Обновляем GUI
+                self.after(0, self._refresh_accounts_list)
+                self.after(0, self._update_dashboard_stats)
+
+                # Сохраняем изменения
+                self._save_accounts_config()
+
+                self._log("✅ Определение валюты завершено для всех аккаунтов")
+
+            except Exception as e:
+                logger.error(f"Error detecting all currencies: {e}")
+                import traceback
+                traceback.print_exc()
+                self._log(f"❌ Ошибка определения валют: {e}")
+
+        # Запускаем в отдельном потоке
+        thread = threading.Thread(target=detect_all_thread, daemon=True)
+        thread.start()
+
     # ============================================================
     # НОВЫЕ МЕТОДЫ: Auto Buyer, Auto Scanner, Statistics
     # ============================================================
-
-    def _show_auto_buy_dialog(self):
-        """Показать диалог настроек автоматической покупки."""
-        # Проверяем, что есть включенный аккаунт
-        enabled_accounts = [acc for acc in self.account_manager.accounts if acc.config.enabled]
-
-        if not enabled_accounts:
-            self._log("⚠️ Нет включенных аккаунтов для автопокупки")
-            return
-
-        if not enabled_accounts[0].is_logged_in():
-            self._log("⚠️ Аккаунт не залогинен. Выполните вход сначала.")
-            return
-
-        # Создаём диалог
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("🛒 Настройки Auto Buy")
-        dialog.geometry("500x400")
-        dialog.transient(self)
-        dialog.grab_set()
-
-        # Заголовок
-        header = ctk.CTkLabel(
-            dialog,
-            text="🛒 Автоматическая покупка",
-            font=ctk.CTkFont(size=16, weight="bold")
-        )
-        header.pack(padx=20, pady=20)
-
-        # Контейнер для настроек
-        settings_frame = ctk.CTkFrame(dialog)
-        settings_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-
-        # Макс. предметов
-        max_items_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        max_items_frame.pack(fill="x", padx=15, pady=10)
-
-        ctk.CTkLabel(max_items_frame, text="Макс. предметов:", width=150, anchor="w").pack(side="left")
-        max_items_entry = ctk.CTkEntry(max_items_frame, width=100)
-        max_items_entry.insert(0, str(self.bot_config.get('auto_buy_max_items', 10)))
-        max_items_entry.pack(side="left", padx=5)
-
-        # Макс. цена за предмет
-        max_price_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        max_price_frame.pack(fill="x", padx=15, pady=10)
-
-        ctk.CTkLabel(max_price_frame, text="Макс. цена (₽):", width=150, anchor="w").pack(side="left")
-        max_price_entry = ctk.CTkEntry(max_price_frame, width=100)
-        max_price_entry.insert(0, str(self.bot_config.get('auto_buy_max_price', 1000.0)))
-        max_price_entry.pack(side="left", padx=5)
-
-        # Общий бюджет
-        budget_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        budget_frame.pack(fill="x", padx=15, pady=10)
-
-        ctk.CTkLabel(budget_frame, text="Общий бюджет (₽):", width=150, anchor="w").pack(side="left")
-        budget_entry = ctk.CTkEntry(budget_frame, width=100)
-        budget_entry.insert(0, str(self.bot_config.get('auto_buy_total_budget', 5000.0)))
-        budget_entry.pack(side="left", padx=5)
-
-        # Мин. профит
-        min_profit_frame = ctk.CTkFrame(settings_frame, fg_color="transparent")
-        min_profit_frame.pack(fill="x", padx=15, pady=10)
-
-        ctk.CTkLabel(min_profit_frame, text="Мин. профит (%):", width=150, anchor="w").pack(side="left")
-        min_profit_entry = ctk.CTkEntry(min_profit_frame, width=100)
-        min_profit_entry.insert(0, str(self.bot_config.get('auto_buy_min_profit', 15.0)))
-        min_profit_entry.pack(side="left", padx=5)
-
-        # Информация
-        info_label = ctk.CTkLabel(
-            settings_frame,
-            text="Бот автоматически купит предметы из списка\nс учётом заданных ограничений.",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        info_label.pack(padx=15, pady=20)
-
-        # Кнопки
-        button_frame = ctk.CTkFrame(dialog, fg_color="transparent")
-        button_frame.pack(fill="x", padx=20, pady=(0, 20))
-
-        def start_auto_buy():
-            try:
-                max_items = int(max_items_entry.get())
-                max_price = float(max_price_entry.get())
-                budget = float(budget_entry.get())
-                min_profit = float(min_profit_entry.get())
-
-                # Сохраняем настройки
-                self.bot_config['auto_buy_max_items'] = max_items
-                self.bot_config['auto_buy_max_price'] = max_price
-                self.bot_config['auto_buy_total_budget'] = budget
-                self.bot_config['auto_buy_min_profit'] = min_profit
-                self._save_bot_config()
-
-                dialog.destroy()
-
-                # Запускаем автопокупку
-                self._run_auto_buy(max_items, max_price, budget, min_profit)
-
-            except ValueError:
-                self._log("❌ Неверный формат числа в настройках")
-
-        ctk.CTkButton(
-            button_frame,
-            text="🛒 Запустить покупку",
-            command=start_auto_buy,
-            fg_color="#9B59B6",
-            width=150
-        ).pack(side="left", padx=5)
-
-        ctk.CTkButton(
-            button_frame,
-            text="❌ Отмена",
-            command=dialog.destroy,
-            fg_color="#95A5A6",
-            width=100
-        ).pack(side="left", padx=5)
-
-    def _run_auto_buy(self, max_items, max_price, budget, min_profit):
-        """Запустить автоматическую покупку."""
-        def buy_thread():
-            try:
-                self._log("🛒 Запуск автоматической покупки...")
-
-                # Получаем включенный аккаунт
-                enabled_accounts = [acc for acc in self.account_manager.accounts if acc.config.enabled]
-                if not enabled_accounts:
-                    self._log("❌ Нет включенных аккаунтов")
-                    return
-
-                account = enabled_accounts[0]
-
-                # Создаём AutoBuyer
-                self.auto_buyer = AutoBuyer(
-                    steam_client=account.steam_client,
-                    db=trades_db,
-                    account_name=account.name
-                )
-
-                # Получаем предметы из БД
-                items = trades_db.get_active_profitable_items(limit=1000)
-
-                if not items:
-                    self._log("⚠️ Нет предметов для покупки")
-                    return
-
-                self._log(f"📊 Найдено {len(items)} предметов. Начинаем покупку...")
-
-                # Запускаем автопокупку
-                stats = self.auto_buyer.auto_buy_from_list(
-                    items=items,
-                    max_items=max_items,
-                    max_price_per_item=max_price,
-                    total_budget=budget,
-                    min_profit_pct=min_profit
-                )
-
-                # Выводим результаты
-                self._log("=" * 50)
-                self._log("📊 РЕЗУЛЬТАТЫ АВТОПОКУПКИ:")
-                self._log(f"   Обработано: {stats['processed']}")
-                self._log(f"   Куплено: {stats['bought']}")
-                self._log(f"   Пропущено: {stats['skipped']}")
-                self._log(f"   Ошибок: {stats['errors']}")
-                self._log(f"   Потрачено: {stats['total_spent']:.2f} ₽")
-                self._log("=" * 50)
-
-            except Exception as e:
-                logger.error(f"Error in auto buy: {e}", exc_info=True)
-                self._log(f"❌ Ошибка автопокупки: {e}")
-
-        thread = threading.Thread(target=buy_thread, daemon=True)
-        thread.start()
 
     def _toggle_auto_scan(self):
         """Переключить автосканирование."""
@@ -3157,24 +3817,34 @@ class TradingBotGUI(ctk.CTk):
             self._log("⏰ Автосканирование остановлено")
         else:
             # Запустить
-            interval = self.bot_config.get('auto_scan_interval', 30)
+            scan_interval = self.bot_config.get('auto_scan_interval', 30)
+            rescan_interval = self.bot_config.get('auto_rescan_interval', 60)
+            new_items_count = self.bot_config.get('auto_scan_new_items', 10)
 
             # Создаём AutoScanner если его нет
             if not self.auto_scanner:
                 self.auto_scanner = AutoScanner(
                     scan_callback=self._start_scanner,
-                    interval_minutes=interval,
+                    rescan_callback=self._rescan_all_items,
+                    new_items_callback=self._scan_new_items_auto,
+                    interval_minutes=scan_interval,
+                    rescan_interval_minutes=rescan_interval,
+                    new_items_count=new_items_count,
                     enabled=False
                 )
 
-            self.auto_scanner.set_interval(interval)
+            self.auto_scanner.set_interval(scan_interval)
+            self.auto_scanner.set_rescan_interval(rescan_interval)
+            self.auto_scanner.set_new_items_count(new_items_count)
             self.auto_scanner.start()
 
             self.auto_scan_toggle_btn.configure(
-                text=f"⏰ Auto Scan: ON ({interval}m)",
+                text=f"⏰ Auto Scan: ON ({scan_interval}m)",
                 fg_color="#27AE60"
             )
-            self._log(f"⏰ Автосканирование запущено (интервал: {interval} минут)")
+            self._log(f"⏰ Автосканирование запущено:")
+            self._log(f"   - Новые предметы: каждые {scan_interval} минут ({new_items_count} шт)")
+            self._log(f"   - Пересканирование: каждые {rescan_interval} минут")
 
     def _show_statistics_window(self):
         """Показать окно статистики."""
@@ -3328,61 +3998,17 @@ class TradingBotGUI(ctk.CTk):
         thread = threading.Thread(target=export_thread, daemon=True)
         thread.start()
 
-    def _show_confirmations_dialog(self):
-        """Показать диалог подтверждений."""
-        # Проверяем, что есть включенный аккаунт
-        enabled_accounts = [acc for acc in self.account_manager.accounts if acc.config.enabled]
-
-        if not enabled_accounts:
-            self._log("⚠️ Нет включенных аккаунтов")
-            return
-
-        account = enabled_accounts[0]
-
-        if not account.is_logged_in():
-            self._log("⚠️ Аккаунт не залогинен")
-            return
-
-        def confirm_thread():
-            try:
-                from src.confirmations import ConfirmationHandler
-
-                self._log("🔍 Проверка ожидающих подтверждений...")
-
-                handler = ConfirmationHandler(account.steam_client)
-                confirmations = handler.get_confirmations()
-
-                if not confirmations:
-                    self._log("✅ Нет ожидающих подтверждений")
-                    return
-
-                self._log(f"📋 Найдено {len(confirmations)} ожидающих подтверждений:")
-                for conf in confirmations:
-                    self._log(f"  - {conf.description} (ID: {conf.id})")
-
-                self._log("🔄 Автоматическое подтверждение...")
-                results = handler.confirm_all()
-
-                self._log("=" * 50)
-                self._log("📊 РЕЗУЛЬТАТЫ ПОДТВЕРЖДЕНИЯ:")
-                self._log(f"   Market listings: {results['market']}")
-                self._log(f"   Trade offers: {results['trade']}")
-                self._log(f"   Прочие: {results['other']}")
-                self._log(f"   Ошибки: {results['failed']}")
-                self._log("=" * 50)
-
-            except Exception as e:
-                logger.error(f"Error in confirmations: {e}", exc_info=True)
-                self._log(f"❌ Ошибка подтверждения: {e}")
-
-        thread = threading.Thread(target=confirm_thread, daemon=True)
-        thread.start()
-
     def _on_closing(self):
         """Обработка закрытия окна."""
         if self.bot_running:
             self._stop_bot()
             time.sleep(1)
+
+        # Shutdown AsyncRunner
+        if hasattr(self, 'async_runner') and self.async_runner:
+            from src.async_helper import shutdown_async_runner
+            logger.info("Shutting down AsyncRunner...")
+            shutdown_async_runner()
 
         self.destroy()
 

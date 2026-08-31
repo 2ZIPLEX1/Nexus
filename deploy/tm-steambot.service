@@ -1,0 +1,71 @@
+[Unit]
+Description=TM Steam Bot — headless server_runner (buy + sell + scan 24/7)
+After=network-online.target
+Wants=network-online.target
+
+# Не входить в бесконечный цикл рестартов при постоянном падении:
+# максимум 5 рестартов за 5 минут, иначе служба останавливается (смотри логи).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# --- ПОДСТАВЬ СВОИ ЗНАЧЕНИЯ ---
+User=botuser
+WorkingDirectory=/opt/tm-steambot
+# venv с установленными requirements.txt
+ExecStart=/opt/tm-steambot/.venv/bin/python server_runner.py
+# ------------------------------
+
+# Логи без буферизации (иначе journalctl отстаёт), UTF-8 на всякий случай
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+
+# Авто-рестарт при любом падении/выходе
+Restart=always
+RestartSec=15
+
+# Мягкая остановка: SIGTERM → server_runner ловит и корректно закрывает сессии
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+# stdout/stderr → journald (смотреть: journalctl -u tm-steambot -f)
+StandardOutput=journal
+StandardError=journal
+
+# --- Изоляция -------------------------------------------------------------
+# Процесс держит пароли Steam, семена Guard и ключи API. Ограничения не дают
+# ему (и тому, кто его сломает) выйти за пределы каталога бота.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# ProtectSystem=strict делает ФС read-only — открываем только рабочие пути.
+ReadWritePaths=/opt/tm-steambot/data /opt/tm-steambot/logs
+ReadWritePaths=/opt/tm-steambot/bot_config.json /opt/tm-steambot/scanner_config.json
+
+# Новые файлы — 600/700, чтобы accounts.json и cookies не читались чужими.
+UMask=0077
+
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

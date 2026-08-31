@@ -143,8 +143,9 @@ class CSGOMarketAPI:
 
     BASE_URL = "https://market.csgo.com/api/v2"
 
-    def __init__(self, currency: Currency = Currency.RUB):
+    def __init__(self, currency: Currency = Currency.RUB, proxy: Optional[str] = None):
         self.currency = currency
+        self.proxy = proxy  # Прокси в формате "socks5://user:pass@host:port"
         self._session: Optional[aiohttp.ClientSession] = None
         self._names_cache: dict[int, str] = {}  # item_id -> market_hash_name
         self._reverse_names_cache: dict[str, int] = {}  # market_hash_name -> item_id
@@ -154,16 +155,35 @@ class CSGOMarketAPI:
     async def _get_session(self) -> aiohttp.ClientSession:
         async with self._session_lock:
             if self._session is None or self._session.closed:
+                # Создаем connector с поддержкой прокси
+                connector = None
+                if self.proxy:
+                    # Только host:port. Срез [:20] показывал начало user:pass —
+                    # маскирующий фильтр логов такой обрезок уже не распознаёт.
+                    logger.debug(f"Creating session with proxy: {self.proxy.split('@')[-1]}")
+                    from aiohttp_socks import ProxyConnector
+                    try:
+                        connector = ProxyConnector.from_url(self.proxy)
+                    except Exception as e:
+                        logger.warning(f"Failed to create proxy connector: {e}, using direct connection")
+
                 self._session = aiohttp.ClientSession(
                     headers={
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    }
+                    },
+                    connector=connector,
+                    # Без явного таймаута aiohttp ждёт 5 минут: один зависший
+                    # прокси из proxies.txt стопорил весь цикл сканирования.
+                    timeout=aiohttp.ClientTimeout(total=30, connect=10),
                 )
             return self._session
 
     async def close(self):
+        """Close the session and wait for proper cleanup."""
         if self._session and not self._session.closed:
             await self._session.close()
+            # Wait for underlying connections to close
+            await asyncio.sleep(0.25)
 
     async def load_names_dictionary(self) -> dict[int, str]:
         """

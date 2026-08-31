@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from pydantic import Field, ValidationError
+from pydantic import Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Project root directory (parent of config/)
@@ -25,19 +25,23 @@ class Settings(BaseSettings):
     )
 
     # --- Steam Account ---
+    # SecretStr: значение не появляется в repr(settings), в model_dump() и в
+    # трейсбеках. В проекте ~45 мест с exc_info=True, и любой кадр стека,
+    # держащий Settings, раньше печатал пароль и оба Guard-секрета целиком.
+    # Читать значение — только через .get_secret_value().
     steam_username: str = Field(..., description="Steam account username")
-    steam_password: str = Field(..., description="Steam account password")
-    steam_api_key: str = Field(..., description="Steam Web API key")
+    steam_password: SecretStr = Field(..., description="Steam account password")
+    steam_api_key: SecretStr = Field(..., description="Steam Web API key")
 
     # --- Steam Guard Secrets ---
-    steam_shared_secret: str = Field(..., description="Steam Guard shared secret for 2FA")
-    steam_identity_secret: str = Field(..., description="Steam Guard identity secret for confirmations")
+    steam_shared_secret: SecretStr = Field(..., description="Steam Guard shared secret for 2FA")
+    steam_identity_secret: SecretStr = Field(..., description="Steam Guard identity secret for confirmations")
 
     # --- CSGO.TM API ---
-    csgotm_api_key: str = Field(..., description="CSGO.TM API key")
+    csgotm_api_key: SecretStr = Field(..., description="CSGO.TM API key")
 
     # --- Telegram Bot ---
-    telegram_bot_token: Optional[str] = Field(None, description="Telegram bot token")
+    telegram_bot_token: Optional[SecretStr] = Field(None, description="Telegram bot token")
     telegram_chat_id: Optional[str] = Field(None, description="Telegram chat ID for notifications")
 
     # --- Database Paths ---
@@ -62,10 +66,14 @@ class Settings(BaseSettings):
 
     @property
     def steam_guard(self) -> dict:
-        """Return Steam Guard credentials as dict for steampy."""
+        """Return Steam Guard credentials as dict for steampy.
+
+        Разворачивает SecretStr — получившийся dict содержит секреты открытым
+        текстом, поэтому его нельзя логировать целиком.
+        """
         return {
-            "shared_secret": self.steam_shared_secret,
-            "identity_secret": self.steam_identity_secret,
+            "shared_secret": self.steam_shared_secret.get_secret_value(),
+            "identity_secret": self.steam_identity_secret.get_secret_value(),
         }
 
     def calculate_max_orders_value(self, balance: float) -> float:
@@ -73,12 +81,11 @@ class Settings(BaseSettings):
         return balance * self.order_limit_multiplier
 
     def calculate_net_profit(self, buy_price: float, sell_price: float) -> float:
-        """Calculate net profit after CSGO.TM commission."""
-        net_sell = sell_price * (1 - self.csgotm_commission)
-        return net_sell - buy_price
+        """Calculate net profit WITHOUT commission."""
+        return sell_price - buy_price
 
     def calculate_profit_percent(self, buy_price: float, sell_price: float) -> float:
-        """Calculate profit percentage after commission."""
+        """Calculate profit percentage WITHOUT commission."""
         if buy_price <= 0:
             return 0.0
         net_profit = self.calculate_net_profit(buy_price, sell_price)
@@ -115,7 +122,13 @@ def _create_settings() -> Settings:
             print("ERROR: Invalid configuration!", file=sys.stderr)
             print("=" * 60, file=sys.stderr)
             print(f"\nYour .env file at {ENV_FILE} has errors:\n", file=sys.stderr)
-            print(str(e), file=sys.stderr)
+            # Ошибка валидации может процитировать введённое значение — чистим,
+            # чтобы креды не осели в консоли и в journald.
+            try:
+                from src.logger import redact_text
+                print(redact_text(str(e)), file=sys.stderr)
+            except Exception:
+                print(str(e), file=sys.stderr)
             print(f"\nPlease check {ENV_EXAMPLE} for the correct format.", file=sys.stderr)
             print("\n" + "=" * 60 + "\n", file=sys.stderr)
             sys.exit(1)

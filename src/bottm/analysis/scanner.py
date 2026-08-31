@@ -121,29 +121,47 @@ class ItemScanner:
         proxy_list: Optional[list[str]] = None,
         requests_per_proxy: int = 15,
         filters: Optional[FilterSettings] = None,
+        excluded_items: Optional[set[str]] = None,
     ):
+        logger.info(f"[DEBUG] ItemScanner.__init__: proxy_url={proxy_url is not None}, proxy_list={len(proxy_list) if proxy_list else 0}, requests_per_proxy={requests_per_proxy}")
+
         self.database = database
         self.currency = currency
         self.filters = filters or config.filters
+        self.excluded_items = excluded_items or set()  # Items to always exclude (e.g., auto_buy items)
 
-        self.csgo_api = CSGOMarketAPI(currency=currency)
+        # ВАЖНО: Передаем прокси в CSGO Market API для обхода блокировок
+        self.csgo_api = CSGOMarketAPI(currency=currency, proxy=proxy_url)
+        logger.info(f"[DEBUG] ItemScanner.__init__: Created CSGOMarketAPI")
+
         self.steam_api = SteamMarketAPI(
             currency=currency,
             proxy_url=proxy_url,
             proxy_list=proxy_list,
             requests_per_proxy=requests_per_proxy,
         )
+        logger.info(f"[DEBUG] ItemScanner.__init__: Created SteamMarketAPI")
 
         self._candidates: list[ItemMarketPrice] = []
 
     async def close(self):
-        """Close API sessions."""
+        """Close API sessions and ensure proper cleanup."""
         # Give pending requests time to complete
         await asyncio.sleep(0.1)
-        await self.csgo_api.close()
-        await self.steam_api.close()
-        # Final sleep to ensure cleanup
-        await asyncio.sleep(0.1)
+
+        # Close both APIs
+        try:
+            await self.csgo_api.close()
+        except Exception as e:
+            logger.warning(f"Error closing CSGO API: {e}")
+
+        try:
+            await self.steam_api.close()
+        except Exception as e:
+            logger.warning(f"Error closing Steam API: {e}")
+
+        # Final sleep to ensure all connections are cleaned up
+        await asyncio.sleep(0.2)
 
     async def load_data(self):
         """Load all necessary data from APIs."""
@@ -155,11 +173,14 @@ class ItemScanner:
 
         logger.info("Data loaded!")
 
-    def filter_candidates(self) -> list[ItemMarketPrice]:
+    def filter_candidates(self, exclude_existing: bool = False) -> list[ItemMarketPrice]:
         """
         Filter items by basic criteria (price range, type).
 
         This is a fast pre-filter before checking Steam prices.
+
+        Args:
+            exclude_existing: If True, exclude items already in database (for "Scan New")
         """
         candidates = []
 
@@ -167,7 +188,29 @@ class ItemScanner:
         logger.info(f"Filters: min_price={self.filters.min_price}, max_price={self.filters.max_price}, "
                    f"min_sales_7d={self.filters.min_sales_7d}")
 
+        # Get existing items from database if needed
+        existing_items = set()
+        skipped_existing = 0
+        skipped_excluded = 0
+        if exclude_existing:
+            existing_items = self.database.get_all_profitable_item_names()
+            logger.info(f"🔍 Scan New mode: Excluding {len(existing_items)} items already in database")
+
+        # Log excluded items from auto_buy
+        if self.excluded_items:
+            logger.info(f"🚫 Excluding {len(self.excluded_items)} items from auto_buy list")
+
         for name, price_data in self.csgo_api._prices_cache.items():
+            # Skip items in excluded list (auto_buy items)
+            if name in self.excluded_items:
+                skipped_excluded += 1
+                continue
+
+            # Skip items already in database (for "Scan New")
+            if exclude_existing and name in existing_items:
+                skipped_existing += 1
+                continue
+
             # Check item type (only weapon skins and agents)
             item_type = detect_item_type(name)
             if item_type not in [ItemType.WEAPON_SKIN, ItemType.AGENT]:
@@ -193,7 +236,19 @@ class ItemScanner:
         candidates.sort(key=lambda x: x.popularity_7d, reverse=True)
 
         self._candidates = candidates
-        logger.info(f"Found {len(candidates)} candidates after basic filtering (sorted by popularity)")
+
+        # Build summary message
+        summary_parts = []
+        if skipped_excluded > 0:
+            summary_parts.append(f"{skipped_excluded} auto_buy items")
+        if exclude_existing and skipped_existing > 0:
+            summary_parts.append(f"{skipped_existing} existing items")
+
+        if summary_parts:
+            logger.info(f"Found {len(candidates)} candidates (skipped {', '.join(summary_parts)})")
+        else:
+            logger.info(f"Found {len(candidates)} candidates after filtering (sorted by popularity)")
+
         return candidates
 
     async def analyze_item(self, price_data: ItemMarketPrice) -> Optional[ProfitableItem]:
@@ -206,7 +261,14 @@ class ItemScanner:
         item_type = detect_item_type(name)
 
         # Get Steam market data
-        steam_info = await self.steam_api.get_full_market_info(name)
+        try:
+            steam_info = await self.steam_api.get_full_market_info(name)
+        except asyncio.TimeoutError:
+            logger.warning(f"  ⏱️ Timeout getting Steam market info, skipping item")
+            return None
+        except Exception as e:
+            logger.warning(f"  ❌ Error getting Steam market info: {e}")
+            return None
 
         price_overview = steam_info.get("price_overview")
         buy_orders = steam_info.get("buy_orders")
@@ -217,7 +279,8 @@ class ItemScanner:
             steam_buy_order = buy_orders.highest_buy_order
 
         if not steam_buy_order:
-            logger.info(f"  No Steam buy order data")
+            reason = getattr(buy_orders, "error", None) if buy_orders else "no_buy_orders_response"
+            logger.info(f"  No Steam buy order data ({reason})")
             return None
 
         logger.info(f"  Steam buy: {steam_buy_order:.0f} | CSGO sell: {price_data.price:.0f} / buy_order: {price_data.buy_order:.0f}")
@@ -258,8 +321,15 @@ class ItemScanner:
         # Get Steam price history for validation and smarter buy order recommendations
         # Use last 7 days for recent/relevant prices
         # History is in USD, we need to convert to target currency
-        steam_history = await self.steam_api.get_price_history(name, days=7)
-        steam_history_avg = steam_history.avg_price if steam_history and steam_history.success else None
+        try:
+            steam_history = await self.steam_api.get_price_history(name, days=7)
+            steam_history_avg = steam_history.avg_price if steam_history and steam_history.success else None
+        except asyncio.TimeoutError:
+            logger.warning(f"  ⏱️ Timeout getting price history, skipping item")
+            return None
+        except Exception as e:
+            logger.warning(f"  ❌ Error getting price history: {e}")
+            return None
 
         # IMPORTANT: Comprehensive data validation
         is_valid, error_msg = validate_item_data(
@@ -329,11 +399,12 @@ class ItemScanner:
 
         # Calculate profit at CURRENT buy order (without fee - user pays fee separately)
         # Profit = Sell on CSGO.TM - Buy on Steam
-        csgo_sell_price = price_data.price
+        # Use conservative approach: minimum of avg_price and current price for safe estimation
+        csgo_sell_price = min(price_data.avg_price, price_data.price)
         profit = csgo_sell_price - steam_buy_order
         profit_pct = (profit / steam_buy_order) * 100
 
-        logger.info(f"  Profit calc: CSGO sell={csgo_sell_price:.0f}, Steam buy={steam_buy_order:.0f}, profit={profit:.0f} ({profit_pct:.1f}%)")
+        logger.info(f"  Profit calc: CSGO min sell={csgo_sell_price:.0f} (avg={price_data.avg_price:.0f}, current={price_data.price:.0f}), Steam buy={steam_buy_order:.0f}, profit={profit:.0f} ({profit_pct:.1f}%)")
 
         # Calculate profit at RECOMMENDED buy order (based on history)
         recommended_profit = None
@@ -348,8 +419,12 @@ class ItemScanner:
         if recommended_profit_pct is not None:
             best_profit_pct = max(best_profit_pct, recommended_profit_pct)
 
-        # Show ALL items regardless of profit (goal is to withdraw with minimal loss)
-        logger.info(f"  FOUND: profit={profit_pct:.1f}%")
+        # Filter by minimum profit margin
+        if best_profit_pct < self.filters.min_profit_margin:
+            logger.info(f"  ❌ Profit too low: {best_profit_pct:.1f}% < {self.filters.min_profit_margin:.1f}% (min required)")
+            return None
+
+        logger.info(f"  ✅ FOUND: profit={profit_pct:.1f}%")
         if recommended_profit_pct is not None:
             logger.info(f"  @ Recommended: profit={recommended_profit_pct:.1f}%")
         if steam_spread_pct:
@@ -359,7 +434,7 @@ class ItemScanner:
         item = ProfitableItem(
             market_hash_name=name,
             item_type=item_type,
-            csgo_price=price_data.price,
+            csgo_price=csgo_sell_price,  # Use weighted price (same as used for profit calculation)
             csgo_buy_order=price_data.buy_order,
             csgo_avg_price=price_data.avg_price,
             csgo_popularity_7d=price_data.popularity_7d,
@@ -396,14 +471,18 @@ class ItemScanner:
         max_items: int = 100,
         delay_between_items: float = 1.5,
         parallel: int = 1,
+        max_candidates_to_check: int = 500,
+        exclude_existing: bool = False,
     ) -> list[ProfitableItem]:
         """
         Scan for profitable items.
 
         Args:
-            max_items: Maximum items to check (Steam has rate limits)
+            max_items: Target number of PROFITABLE items to find
             delay_between_items: Delay between Steam API calls
             parallel: Number of parallel workers (use number of proxies)
+            max_candidates_to_check: Maximum candidates to check before stopping (default: 500)
+            exclude_existing: If True, only scan NEW items not in database (for "Scan New")
 
         Returns:
             List of profitable items sorted by profit potential
@@ -414,7 +493,7 @@ class ItemScanner:
 
         # Get candidates
         logger.info("Filtering candidates from CSGO Market data...")
-        candidates = self.filter_candidates()
+        candidates = self.filter_candidates(exclude_existing=exclude_existing)
         logger.info(f"Found {len(candidates)} candidates after filtering")
 
         if not candidates:
@@ -424,31 +503,74 @@ class ItemScanner:
         # Sort by popularity (more trades = more reliable)
         candidates.sort(key=lambda x: x.popularity_7d, reverse=True)
 
-        # Limit to max_items
-        candidates = candidates[:max_items]
-        logger.info(f"Limited to {len(candidates)} items for analysis")
-
-        logger.info(f"Starting analysis of {len(candidates)} items (parallel workers: {parallel})...")
+        logger.info(f"Target: find {max_items} profitable items (will check up to {max_candidates_to_check} candidates)")
 
         profitable_items = []
         semaphore = asyncio.Semaphore(parallel)
-        counter = {"done": 0, "total": len(candidates)}
+        counter = {"checked": 0, "total_candidates": len(candidates), "consecutive_timeouts": 0}
         lock = asyncio.Lock()
+        stop_scanning = asyncio.Event()
+        MAX_CONSECUTIVE_TIMEOUTS = 5  # Stop if 5 items timeout in a row
 
         async def process_item(candidate):
+            # Check if we should stop
+            if stop_scanning.is_set():
+                return
+
             async with semaphore:
                 try:
                     async with lock:
-                        counter["done"] += 1
-                        idx = counter["done"]
+                        counter["checked"] += 1
+                        idx = counter["checked"]
 
-                    logger.info(f"[{idx}/{counter['total']}] Checking: {candidate.market_hash_name}")
+                        # Stop if we reached max candidates to check
+                        if idx > max_candidates_to_check:
+                            logger.info(f"Reached maximum candidates limit ({max_candidates_to_check}), stopping scan")
+                            stop_scanning.set()
+                            return
 
-                    item = await self.analyze_item(candidate)
+                        # Stop if we found enough profitable items
+                        if len(profitable_items) >= max_items:
+                            logger.info(f"Found {max_items} profitable items, stopping scan")
+                            stop_scanning.set()
+                            return
+
+                        # Stop if too many consecutive timeouts
+                        if counter["consecutive_timeouts"] >= MAX_CONSECUTIVE_TIMEOUTS:
+                            logger.error(f"Too many consecutive timeouts ({MAX_CONSECUTIVE_TIMEOUTS}), stopping scan")
+                            stop_scanning.set()
+                            return
+
+                    # Show current proxy being used
+                    proxy_info = self.steam_api.get_current_proxy_info()
+                    logger.info(f"[{idx}] Checking: {candidate.market_hash_name} (found: {len(profitable_items)}/{max_items}) [proxy: {proxy_info}]")
+
+                    # Wrap analyze_item with timeout to prevent hanging
+                    had_timeout = False
+                    try:
+                        item = await asyncio.wait_for(
+                            self.analyze_item(candidate),
+                            timeout=30.0  # 30 second timeout for entire analysis
+                        )
+                        # Reset timeout counter on successful analysis (no timeout)
+                        async with lock:
+                            counter["consecutive_timeouts"] = 0
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏱️ Item analysis timeout (30s): {candidate.market_hash_name}")
+                        async with lock:
+                            counter["consecutive_timeouts"] += 1
+                        had_timeout = True
+                        item = None
+
+                        # ВАЖНО: Rotate proxy after timeout to avoid getting stuck on slow proxy
+                        try:
+                            await self.steam_api._rotate_proxy(reason="item_timeout")
+                            logger.info(f"  Rotated proxy after timeout")
+                        except Exception as e:
+                            logger.warning(f"  Failed to rotate proxy: {e}")
 
                     if item:
                         async with lock:
-                            profitable_items.append(item)
                             # Save to database - convert ProfitableItem to dict
                             item_data = {
                                 'market_hash_name': item.market_hash_name,
@@ -461,13 +583,27 @@ class ItemScanner:
                                 'recommended_profit_pct': item.recommended_profit_pct,
                                 'orders_above': item.orders_above_recommended,
                             }
-                            is_new = self.database.add_or_update_profitable_item(item_data)
-                            if is_new:
-                                logger.info(f"  -> FOUND! (added to DB)")
-                            else:
-                                logger.info(f"  -> FOUND! (updated in DB)")
+                            is_new, was_inactive = self.database.add_or_update_profitable_item(item_data)
 
+                            # For Scan New, only count truly NEW items or reactivated items
+                            if exclude_existing and not is_new and not was_inactive:
+                                logger.info(f"  -> Item already in DB (active), skipping (not counted as new)")
+                            else:
+                                profitable_items.append(item)
+                                if is_new:
+                                    logger.info(f"  -> FOUND! (added to DB) [{len(profitable_items)}/{max_items}]")
+                                elif was_inactive:
+                                    logger.info(f"  -> FOUND! (reactivated from inactive) [{len(profitable_items)}/{max_items}]")
+                                else:
+                                    logger.info(f"  -> FOUND! (updated in DB) [{len(profitable_items)}/{max_items}]")
+
+                except asyncio.TimeoutError:
+                    async with lock:
+                        counter["consecutive_timeouts"] += 1
+                    logger.error(f"⏱️ Timeout analyzing {candidate.market_hash_name} (consecutive: {counter['consecutive_timeouts']})")
                 except Exception as e:
+                    async with lock:
+                        counter["consecutive_timeouts"] += 1
                     logger.error(f"Error analyzing {candidate.market_hash_name}: {e}")
 
                 # Small delay to avoid hammering
@@ -480,7 +616,10 @@ class ItemScanner:
         # Sort by profit (best first)
         profitable_items.sort(key=lambda x: x.profit_pct or -999, reverse=True)
 
-        logger.info(f"Found {len(profitable_items)} profitable items!")
+        if len(profitable_items) < max_items:
+            logger.warning(f"Only found {len(profitable_items)}/{max_items} profitable items after checking {counter['checked']} candidates")
+        else:
+            logger.info(f"Found {len(profitable_items)} profitable items!")
 
         return profitable_items
 

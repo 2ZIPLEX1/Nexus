@@ -19,6 +19,7 @@ sys.path.insert(0, str(project_root))
 from src.bottm.config import Currency, FilterSettings
 from src.bottm.analysis.scanner import ItemScanner
 from src.database import TradesDatabase
+from src.proxy_utils import load_proxy_file
 
 # Configure logging
 logging.basicConfig(
@@ -74,10 +75,11 @@ class ScannerProcess:
             return []
 
         try:
-            with open(proxy_path, 'r', encoding='utf-8') as f:
-                proxies = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            proxies, skipped = load_proxy_file(proxy_path)
 
             logger.info(f"Loaded {len(proxies)} proxies from {proxy_file}")
+            if skipped:
+                logger.warning(f"Skipped {skipped} invalid proxy entries from {proxy_file}")
             return proxies
 
         except Exception as e:
@@ -118,16 +120,24 @@ class ScannerProcess:
     async def run_scanner(self):
         """Run the scanner with loaded configuration."""
         try:
-            # Extract config
-            min_price = float(self.config.get('min_price', 1000))
-            max_price = float(self.config.get('max_price', 10000))
-            min_profit = float(self.config.get('min_profit', -5.0))
-            min_sales_7d = int(self.config.get('min_sales_7d', 50))
-            proxy_file = self.config.get('proxy_file', 'proxies.txt')
-            requests_per_proxy = int(self.config.get('requests_per_proxy', 50))
-            max_items = int(self.config.get('max_items', 10))
-            delay = float(self.config.get('delay', 7.0))
-            workers = int(self.config.get('workers', 1))
+            # Сначала попробуем загрузить общие настройки из bot_config.json
+            bot_config = {}
+            bot_config_path = Path("bot_config.json")
+            if bot_config_path.exists():
+                with open(bot_config_path, 'r', encoding='utf-8') as f:
+                    bot_config = json.load(f)
+                logger.info("Loaded shared settings from bot_config.json")
+
+            # Extract config (приоритет у scanner_config.json, fallback на bot_config.json)
+            min_price = float(self.config.get('min_price', bot_config.get('scanner_min_price', 1000)))
+            max_price = float(self.config.get('max_price', bot_config.get('scanner_max_price', 10000)))
+            min_profit = float(self.config.get('min_profit', bot_config.get('scanner_min_profit', -5.0)))
+            min_sales_7d = int(self.config.get('min_sales_7d', bot_config.get('min_sales_7d', 50)))
+            proxy_file = self.config.get('proxy_file', bot_config.get('proxy_file', 'proxies.txt'))
+            requests_per_proxy = int(self.config.get('requests_per_proxy', bot_config.get('requests_per_proxy', 50)))
+            max_items = int(self.config.get('max_items', bot_config.get('scanner_max_items', 10)))
+            delay = float(self.config.get('delay', bot_config.get('scanner_delay', 7.0)))
+            workers = int(self.config.get('workers', bot_config.get('scanner_workers', 1)))
 
             logger.info(f"Scanner settings: price {min_price}-{max_price}, min profit {min_profit}%")
             logger.info(f"Max items: {max_items}, delay: {delay}s, workers: {workers}")
@@ -157,11 +167,15 @@ class ScannerProcess:
             # Increase requests_per_proxy to avoid rotation
             scan_requests_per_proxy = max(max_items * 10, requests_per_proxy)
 
+            # Use first proxy for CSGO Market API (doesn't rotate, blocked by Russian hosting)
+            first_proxy = proxies[0] if proxies else None
+
             # Create scanner
             self.scanner = ItemScanner(
                 database=db,
                 currency=Currency.RUB,
-                proxy_list=proxies if proxies else None,
+                proxy_url=first_proxy,  # Single proxy for CSGO Market API
+                proxy_list=proxies if proxies else None,  # List for Steam Market API (rotates)
                 requests_per_proxy=scan_requests_per_proxy,
                 filters=filters,
             )

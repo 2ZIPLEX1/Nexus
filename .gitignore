@@ -7,28 +7,31 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+# ВАЖНО: ведущий слеш обязателен. Без него `lib/` — это «любая папка lib на
+# любом уровне», и правило съедало web/frontend/lib/ со всем API-клиентом
+# (api.ts, useLive.ts). В клоне фронтенд после этого просто не собирался.
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
 *.egg-info/
 .installed.cfg
 *.egg
 
 # Virtual environments
 venv/
-ENV/
-env/
 .venv/
+/ENV/
+/env/
 
 # IDE
 .idea/
@@ -57,14 +60,22 @@ logs/
 *steam_guard*
 *secrets*
 steam_cookies*.txt
+steam_cookies*.json
 *.html
 accounts.json
 bot_config.json
 scanner_config.json
+steam_account.json
+wallet_*.json
+temp_config_*.json
 
 # Proxies - NEVER COMMIT!
 proxies.txt
-proxies.example.txt
+# proxies.example.txt is OK to commit (no real credentials)
+
+# Skins list - NEVER COMMIT!
+skins.txt
+# skins.example.txt is OK to commit (no real data)
 
 # Exports
 exports/
@@ -96,3 +107,65 @@ tmpclaude-*
 
 # Test files (user-specific)
 test_*.py
+Steamguard.json
+test_config.json
+accounts.json.backup
+nul
+
+# Auto Claude data directory
+.auto-claude/
+
+# Auto Claude generated files
+.auto-claude-security.json
+.auto-claude-status
+.claude_settings.json
+.worktrees/
+.security-key
+logs/security/
+
+# PyInstaller
+*.spec
+/build/
+/dist/
+
+# Node (страховка — у web/frontend есть свой .gitignore, но он мог не доехать)
+node_modules/
+.next/
+
+# Icon conversion temp files
+convert_icon.py
+
+# --- Дополнительная защита от утечки секретов -------------------------------
+# ВАЖНО: раньше здесь стояла строка `.gitignore`, из-за которой сам файл не
+# попадал в репозиторий — а значит в свежем клоне НЕ РАБОТАЛО НИ ОДНО правило
+# выше, и первый же `git add .` коммитил .env, accounts.json и *.maFile.
+# Не возвращать.
+
+# Логи в корне (правило `logs/` — только каталог, `*.log` не ловит logs.txt)
+logs.txt
+
+# Бэкапы и дампы
+*.bak
+*.bak-*
+*.backup
+*.old
+*.dump
+*.sql
+
+# Черновики/мусор, куда исторически копипастились живые креды
+sdsd
+4.21.0
+check_db_temp*.py
+
+# Страховочные шаблоны на любые файлы с учётными данными
+*credential*
+*.maFile*
+*token*.json
+*.pem
+*.key
+*.p12
+id_rsa*
+
+# Секреты веб-панели (WEB_API_PASSWORD_HASH и т.п.)
+web.env
+web/.env

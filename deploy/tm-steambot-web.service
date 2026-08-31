@@ -1,0 +1,82 @@
+[Unit]
+Description=TM Steam Bot — веб-панель (FastAPI + оркестратор)
+After=network-online.target
+Wants=network-online.target
+
+# Не входить в бесконечный цикл рестартов: 5 рестартов за 5 минут — и стоп.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# --- ПОДСТАВЬ СВОИ ЗНАЧЕНИЯ ---
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/tm-steambot
+ExecStart=/opt/tm-steambot/.venv/bin/python -m web.api
+# ------------------------------
+
+# Секреты панели — отдельным файлом с правами 600, НЕ в Environment= (иначе
+# значение видно в `systemctl show` и в /proc любому пользователю).
+# Внутри как минимум:
+#   WEB_API_PASSWORD_HASH=scrypt$...   ← python -m web.hashpw
+#   WEB_TRUST_PROXY=1                  ← за nginx, иначе rate limit увидит один IP
+# Создать:
+#   sudo mkdir -p /etc/tm-steambot
+#   sudo chmod 600 /etc/tm-steambot/web.env && sudo chown botuser /etc/tm-steambot/web.env
+EnvironmentFile=/etc/tm-steambot/web.env
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+
+# ВНИМАНИЕ: по умолчанию WEB_AUTOSTART=1 — торговля стартует вместе с сервисом
+# и работает реальными деньгами. Чтобы поднимать панель без торговли:
+# Environment=WEB_AUTOSTART=0
+
+Restart=always
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+
+# --- Изоляция -------------------------------------------------------------
+# Процесс держит пароли Steam, семена Guard и ключи API. Если его когда-нибудь
+# сломают через сеть, эти ограничения не дадут выйти за пределы каталога бота.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# ProtectSystem=strict делает всю ФС read-only — явно открываем только своё.
+ReadWritePaths=/opt/tm-steambot/data /opt/tm-steambot/logs
+ReadWritePaths=/opt/tm-steambot/bot_config.json /opt/tm-steambot/scanner_config.json
+
+# Новые файлы создаются с правами 600/700 — чтобы accounts.json и cookies
+# не оказались доступны другим пользователям сервера.
+UMask=0077
+
+# Предохранитель от утечки памяти в долгоживущем процессе.
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

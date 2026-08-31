@@ -1,13 +1,19 @@
 # Steam API
 # steampy==1.1.0  # DEPRECATED - does not work with new Steam API
-steam[client]>=1.4.4  # ValvePython/steam - supports new Steam auth API
+# steam[client]>=1.4.4  # OLD - replaced by aiosteampy
+aiosteampy[all]>=0.4.0  # NEW - Modern async Steam API wrapper (includes socks, converter)
+aiodns>=3.0.0  # aiohttp speedup
+# cchardet>=2.1.7  # aiohttp speedup - DISABLED (requires Visual Studio to compile)
+fake-useragent>=1.4.0  # Generate user-agents for sessions
 
 # CSGO.TM API (unofficial)
-requests>=2.31.0
+# >=2.32.4 — ниже была CVE-2024-35195: verify=False «залипал» на всю Session,
+# и последующие запросы шли без проверки сертификата.
+requests>=2.32.4
 
 # Proxy support
 httpx[socks]>=0.28.1  # SOCKS5 proxy support for Steam API
-pysocks>=1.7.1  # SOCKS proxy support
+pysocks>=1.7.1  # SOCKS proxy support (used by aiosteampy[socks])
 
 # Database
 # sqlite3 is built-in
@@ -25,7 +31,8 @@ apscheduler>=3.10.4
 colorlog>=6.8.0
 
 # Async support
-aiohttp>=3.9.0
+# >=3.10.11 — закрывает CVE-2024-23334 (path traversal) и CVE-2024-30251 (DoS).
+aiohttp>=3.10.11
 aiohttp-socks>=0.8.0  # SOCKS proxy support for bottm
 asyncio-throttle>=1.0.2
 
@@ -36,3 +43,7 @@ beautifulsoup4>=4.12.0  # HTML parsing
 
 # GUI
 customtkinter>=5.2.0  # Modern GUI framework
+
+# Web API (сайт)
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

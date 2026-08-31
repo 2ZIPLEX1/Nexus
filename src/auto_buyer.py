@@ -8,13 +8,13 @@
 - Управление бюджетом
 """
 
-import time
+import asyncio
 from typing import Optional, Dict, List
 from dataclasses import dataclass
 from datetime import datetime
 
 from src.logger import get_logger
-from src.steam_client import SteamClient
+from src.steam_client_aiosteampy import SteamClientAio
 from src.database import TradesDatabase
 from src.confirmations import ConfirmationHandler
 
@@ -35,7 +35,7 @@ class BuyOrderStatus:
 class AutoBuyer:
     """Автоматическая покупка предметов."""
 
-    def __init__(self, steam_client: SteamClient, db: TradesDatabase, account_name: str,
+    def __init__(self, steam_client: SteamClientAio, db: TradesDatabase, account_name: str,
                  auto_confirm: bool = True, blacklist: List[str] = None, whitelist: List[str] = None):
         """
         Initialize auto buyer.
@@ -61,7 +61,7 @@ class AutoBuyer:
         # Initialize confirmation handler
         self.confirmation_handler = ConfirmationHandler(steam_client) if auto_confirm else None
 
-    def create_buy_order(
+    async def create_buy_order(
         self,
         market_hash_name: str,
         price: float,
@@ -85,32 +85,33 @@ class AutoBuyer:
 
             # Проверка баланса
             if check_balance:
-                wallet = self.steam_client.get_wallet_balance()
+                wallet = await self.steam_client.get_wallet_balance()
                 if wallet.balance < (price * quantity / 100):
                     logger.error(f"Insufficient balance: {wallet.balance:.2f} < {(price * quantity / 100):.2f}")
                     return None
 
             # Создаём заказ через Steam API
-            # ВАЖНО: Steam API требует цену в копейках (для RUB)
-            order_id = self.steam_client.create_buy_order(
+            # ВАЖНО: Новый API принимает цену в рублях (не копейках)
+            result = await self.steam_client.create_buy_order(
                 market_hash_name=market_hash_name,
-                price_total=int(price),  # В копейках
+                price=price / 100,  # Конвертируем из копеек в рубли
                 quantity=quantity
             )
 
-            if order_id:
+            if result.success:
+                order_id = result.order_id
                 # Сохраняем в БД
                 self.db.add_active_order(
                     account_name=self.account_name,
                     item_name=market_hash_name,
-                    order_id=order_id,
+                    order_id=str(order_id),
                     price=price / 100,  # В рублях для БД
                     quantity=quantity
                 )
 
                 # Добавляем в активные заказы
-                self.active_orders[order_id] = BuyOrderStatus(
-                    order_id=order_id,
+                self.active_orders[str(order_id)] = BuyOrderStatus(
+                    order_id=str(order_id),
                     item_name=market_hash_name,
                     price=price / 100,
                     quantity=quantity,
@@ -118,8 +119,8 @@ class AutoBuyer:
                     status='active'
                 )
 
-                logger.info(f"✅ Buy order created: {order_id}")
-                return order_id
+                logger.info(f"[OK] Buy order created: {order_id}")
+                return str(order_id)
             else:
                 logger.error(f"Failed to create buy order for {market_hash_name}")
                 return None
@@ -128,7 +129,7 @@ class AutoBuyer:
             logger.error(f"Error creating buy order: {e}", exc_info=True)
             return None
 
-    def cancel_buy_order(self, order_id: str) -> bool:
+    async def cancel_buy_order(self, order_id: str) -> bool:
         """
         Отменить buy order.
 
@@ -141,7 +142,7 @@ class AutoBuyer:
         try:
             logger.info(f"Cancelling buy order: {order_id}")
 
-            success = self.steam_client.cancel_buy_order(order_id)
+            success = await self.steam_client.cancel_buy_order(order_id)
 
             if success:
                 # Обновляем БД
@@ -151,7 +152,7 @@ class AutoBuyer:
                 if order_id in self.active_orders:
                     self.active_orders[order_id].status = 'cancelled'
 
-                logger.info(f"✅ Order cancelled: {order_id}")
+                logger.info(f"[OK] Order cancelled: {order_id}")
                 return True
             else:
                 logger.error(f"Failed to cancel order: {order_id}")
@@ -161,7 +162,7 @@ class AutoBuyer:
             logger.error(f"Error cancelling order: {e}", exc_info=True)
             return False
 
-    def check_order_status(self, order_id: str) -> Optional[str]:
+    async def check_order_status(self, order_id: str) -> Optional[str]:
         """
         Проверить статус заказа.
 
@@ -173,22 +174,25 @@ class AutoBuyer:
         """
         try:
             # Получаем список активных заказов
-            my_orders = self.steam_client.get_my_market_orders()
+            my_orders = await self.steam_client.get_my_market_orders()
 
             # Ищем наш заказ
-            for order in my_orders.get('buy_orders', []):
-                if order.get('market_buy_order_id') == order_id:
+            for order in my_orders:
+                if order.get('order_id') == order_id:
                     # Заказ активен
                     return 'active'
 
             # Если не нашли в активных - проверяем историю
             # (заказ мог быть выполнен или отменён)
-            history = self.steam_client.get_market_history(count=100)
+            history = await self.steam_client.get_market_history(count=100)
 
-            for item in history.get('assets', []):
-                if item.get('purchaseid') == order_id:
-                    # Заказ выполнен
-                    return 'filled'
+            for event in history.get('events', []):
+                # Проверяем по имени предмета и времени (нет purchaseid в новом API)
+                # Если заказ не найден в активных и есть в истории покупок - считаем выполненным
+                if event.get('type') == 'BUY' and order_id in self.active_orders:
+                    order_info = self.active_orders[order_id]
+                    if event.get('market_hash_name') == order_info.item_name:
+                        return 'filled'
 
             # Не нашли нигде - скорее всего отменён
             return 'cancelled'
@@ -197,7 +201,7 @@ class AutoBuyer:
             logger.error(f"Error checking order status: {e}", exc_info=True)
             return None
 
-    def update_all_orders_status(self) -> Dict[str, str]:
+    async def update_all_orders_status(self) -> Dict[str, str]:
         """
         Обновить статус всех активных заказов.
 
@@ -210,7 +214,7 @@ class AutoBuyer:
             if order.status != 'active':
                 continue
 
-            new_status = self.check_order_status(order_id)
+            new_status = await self.check_order_status(order_id)
 
             if new_status and new_status != order.status:
                 logger.info(f"Order {order_id} status changed: {order.status} → {new_status}")
@@ -245,7 +249,7 @@ class AutoBuyer:
             if order.status == 'active'
         )
 
-    def can_afford(self, price: float, quantity: int = 1) -> bool:
+    async def can_afford(self, price: float, quantity: int = 1) -> bool:
         """
         Проверить, хватит ли средств на покупку.
 
@@ -256,7 +260,7 @@ class AutoBuyer:
         Returns:
             True если хватит средств
         """
-        wallet = self.steam_client.get_wallet_balance()
+        wallet = await self.steam_client.get_wallet_balance()
         total_cost = price * quantity
         pending_amount = self.get_total_pending_amount()
 
@@ -267,7 +271,7 @@ class AutoBuyer:
 
         return available >= total_cost
 
-    def auto_buy_from_list(
+    async def auto_buy_from_list(
         self,
         items: List[Dict],
         max_items: int = 10,
@@ -359,13 +363,13 @@ class AutoBuyer:
                     stats['skipped'] += 1
                     continue
 
-                if not self.can_afford(steam_buy_order):
+                if not await self.can_afford(steam_buy_order):
                     logger.warning(f"Insufficient funds for {market_hash_name}")
                     stats['skipped'] += 1
                     continue
 
                 # Создаём заказ
-                order_id = self.create_buy_order(
+                order_id = await self.create_buy_order(
                     market_hash_name=market_hash_name,
                     price=int(steam_buy_order * 100),  # В копейках
                     quantity=1
@@ -377,10 +381,10 @@ class AutoBuyer:
                     spent += steam_buy_order
                     bought_count += 1
 
-                    logger.info(f"✅ Bought {market_hash_name} @ {steam_buy_order:.2f} RUB (profit: {profit_pct:.1f}%)")
+                    logger.info(f"[OK] Bought {market_hash_name} @ {steam_buy_order:.2f} RUB (profit: {profit_pct:.1f}%)")
 
                     # Задержка между покупками
-                    time.sleep(5)
+                    await asyncio.sleep(5)
                 else:
                     stats['errors'] += 1
 
@@ -391,12 +395,12 @@ class AutoBuyer:
         # Автоподтверждение всех покупок
         if self.auto_confirm and stats['bought'] > 0:
             logger.info("Auto-confirming market listings...")
-            confirmed = self.confirm_all_purchases()
+            confirmed = await self.confirm_all_purchases()
             stats['confirmed'] = confirmed
 
         return stats
 
-    def confirm_all_purchases(self) -> int:
+    async def confirm_all_purchases(self) -> int:
         """
         Подтвердить все покупки (market listings).
 
@@ -409,10 +413,10 @@ class AutoBuyer:
 
         try:
             # Даём время Steam для создания confirmations
-            time.sleep(3)
+            await asyncio.sleep(3)
 
-            confirmed = self.confirmation_handler.confirm_all_market_listings()
-            logger.info(f"✅ Confirmed {confirmed} market listings")
+            confirmed = await self.confirmation_handler.confirm_all_market_listings()
+            logger.info(f"[OK] Confirmed {confirmed} market listings")
             return confirmed
 
         except Exception as e:

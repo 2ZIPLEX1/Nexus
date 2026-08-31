@@ -11,6 +11,7 @@ Workflow:
 7. Продает на CSGO.TM
 """
 
+import asyncio
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -19,22 +20,28 @@ from src.logger import get_logger
 from src.account_manager import Account
 from src.database import trades_db
 from src.bottm_parser import bottm_parser
+from src.currency_converter import currency_converter
 from config import settings
 
 logger = get_logger(__name__)
+
+
+def _first_number(*values) -> Optional[float]:
+    """Return the first value that can be safely used in numeric comparisons."""
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 class TradingBot:
     """
     Бот для автоматической торговли Steam Market → CSGO.TM.
     """
-
-    # Минимальный профит для покупки (%)
-    MIN_PROFIT_PCT = 5.0
-
-    # Минимальная и максимальная цена предмета для выставления ордеров (RUB)
-    TRADE_MIN_PRICE = 100.0
-    TRADE_MAX_PRICE = 5000.0
 
     # Задержка между проверками ордеров (секунды)
     ORDER_CHECK_INTERVAL = 60
@@ -49,11 +56,92 @@ class TradingBot:
         self.account = account
         self.name = account.name
 
+        # Загружаем настройки из bot_config.json
+        self._load_config()
+
         logger.info(f"[{self.name}] Trading bot initialized")
+
+    def _load_config(self):
+        """Загрузить настройки из bot_config.json"""
+        import json
+        from pathlib import Path
+
+        config_path = Path("bot_config.json")
+        if config_path.exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+
+            # Настройки профита и цен
+            self.MIN_PROFIT_PCT = config.get('min_profit_pct', -7.0)
+            self.TRADE_MIN_PRICE = config.get('trade_min_price', 1000.0)
+            self.TRADE_MAX_PRICE = config.get('trade_max_price', 5000.0)
+            self.PROXY_FILE = config.get('proxy_file', 'proxies.txt')
+            self.REQUESTS_PER_PROXY = config.get('requests_per_proxy', 50)
+            self.ORDER_RATE_LIMIT_COOLDOWN = config.get('order_rate_limit_cooldown', 180)
+
+            logger.info(f"[{self.name}] Config loaded: min_profit={self.MIN_PROFIT_PCT}%, price_range={self.TRADE_MIN_PRICE}-{self.TRADE_MAX_PRICE}")
+        else:
+            # Значения по умолчанию из bot_config.json
+            self.MIN_PROFIT_PCT = -7.0
+            self.TRADE_MIN_PRICE = 1000.0
+            self.TRADE_MAX_PRICE = 5000.0
+            self.PROXY_FILE = 'proxies.txt'
+            self.REQUESTS_PER_PROXY = 50
+            self.ORDER_RATE_LIMIT_COOLDOWN = 180
+            logger.warning(f"[{self.name}] bot_config.json not found, using defaults")
 
     # ============ Проверка актуальности цен ============
 
-    def _verify_item_profitability(self, item: dict) -> dict:
+    def _load_proxy_list(self) -> list[str]:
+        from pathlib import Path
+
+        proxy_path = Path(self.PROXY_FILE)
+        if not proxy_path.exists():
+            return []
+
+        return [
+            line.strip()
+            for line in proxy_path.read_text(encoding='utf-8').splitlines()
+            if line.strip() and not line.strip().startswith('#')
+        ]
+
+    @staticmethod
+    def _is_rate_limit_error(message: str) -> bool:
+        message = (message or '').lower()
+        return '429' in message or 'rate limit' in message or 'too many requests' in message
+
+    async def _get_current_steam_buy_price(self, item_name: str) -> Optional[float]:
+        proxies = self._load_proxy_list()
+        if proxies:
+            try:
+                from src.bottm.api.steam_market import SteamMarketAPI
+                from src.bottm.config import Currency
+
+                api = SteamMarketAPI(
+                    currency=Currency.RUB,
+                    proxy_list=proxies,
+                    requests_per_proxy=self.REQUESTS_PER_PROXY,
+                )
+                try:
+                    buy_orders = await api.get_buy_orders(item_name, max_retries=min(len(proxies), 5))
+                    if buy_orders.success and buy_orders.highest_buy_order:
+                        return buy_orders.highest_buy_order
+                    logger.warning(
+                        f"[{self.name}] Steam proxy recheck failed for {item_name}: "
+                        f"{buy_orders.error or 'no buy order'}"
+                    )
+                finally:
+                    await api.close()
+            except Exception as e:
+                logger.warning(f"[{self.name}] Steam proxy recheck error for {item_name}: {e}")
+
+        histogram = await self.account.steam_client.get_market_histogram(item_name)
+        if histogram and histogram.get('highest_buy_order'):
+            return histogram['highest_buy_order']
+
+        return None
+
+    async def _verify_item_profitability(self, item: dict) -> dict:
         """
         Проверить актуальность профита перед созданием ордера.
 
@@ -78,16 +166,21 @@ class TradingBot:
             logger.info(f"[{self.name}] 🔍 Проверка актуальности цен для {item_name}...")
 
             # Получаем текущие цены на Steam Market
-            histogram = self.account.steam_client.get_market_histogram(item_name)
-            if not histogram or not histogram.get('highest_buy_order'):
+            current_steam_price = await self._get_current_steam_buy_price(item_name)
+            if not current_steam_price:
                 return {
                     'is_profitable': False,
                     'reason': 'Не удалось получить данные Steam Market'
                 }
 
-            current_steam_price = histogram['highest_buy_order']
 
             # Получаем текущие цены на CSGO.TM
+            if not self.account.csgotm_client:
+                return {
+                    'is_profitable': False,
+                    'reason': 'CSGO.TM клиент не инициализирован'
+                }
+
             csgotm_price_data = self.account.csgotm_client.get_item_price(item_name)
             if not csgotm_price_data or not csgotm_price_data.get('min_price'):
                 return {
@@ -95,15 +188,21 @@ class TradingBot:
                     'reason': 'Не удалось получить данные CSGO.TM'
                 }
 
-            current_csgotm_price = csgotm_price_data['min_price']
+            # Используем консервативный подход: минимум между средней и текущей ценой
+            # Это аналогично логике сканера для избежания фейкового профита
+            min_price = csgotm_price_data['min_price']
+            avg_price = csgotm_price_data.get('average_price', min_price)
+            current_csgotm_price = min(avg_price, min_price)
 
-            # Рассчитываем профит с учетом комиссии CSGO.TM (7%)
-            # Чистая выручка = цена продажи - комиссия 7%
-            net_revenue = current_csgotm_price * 0.93
+            logger.debug(
+                f"[{self.name}] CSGO.TM prices: min={min_price:.2f}, avg={avg_price:.2f}, "
+                f"using conservative={current_csgotm_price:.2f}"
+            )
 
-            # Профит = (выручка - затраты) / затраты * 100%
+            # Рассчитываем профит БЕЗ учета комиссии CSGO.TM
+            # Профит = (цена продажи - затраты) / затраты * 100%
             if current_steam_price > 0:
-                current_profit_pct = ((net_revenue - current_steam_price) / current_steam_price) * 100
+                current_profit_pct = ((current_csgotm_price - current_steam_price) / current_steam_price) * 100
             else:
                 current_profit_pct = 0
 
@@ -153,7 +252,8 @@ class TradingBot:
             # Все проверки пройдены!
             logger.info(
                 f"[{self.name}] ✅ Предмет актуален: Steam {current_steam_price:.2f} → "
-                f"CSGO.TM {current_csgotm_price:.2f} (профит: {current_profit_pct:.1f}%)"
+                f"CSGO.TM {current_csgotm_price:.2f} conservative (min={min_price:.2f}, avg={avg_price:.2f}) "
+                f"→ профит: {current_profit_pct:.1f}%"
             )
 
             return {
@@ -175,7 +275,7 @@ class TradingBot:
 
     def get_profitable_items(self, limit: Optional[int] = None) -> list[dict]:
         """
-        Получить прибыльные предметы из bottm.db.
+        Получить прибыльные предметы из my_trades.db (GUI database).
 
         Args:
             limit: Максимум предметов (None = без ограничения)
@@ -184,48 +284,54 @@ class TradingBot:
             List of profitable items as dicts
         """
         try:
-            # Получаем все предметы из bottm
-            items = bottm_parser.get_all_items()
+            from src.database import TradesDatabase
+
+            # Получаем предметы из GUI database (my_trades.db)
+            db = TradesDatabase()
+            items = db.get_active_profitable_items(min_profit=self.MIN_PROFIT_PCT, limit=limit or 1000)
 
             if not items:
-                logger.warning(f"[{self.name}] No items found in bottm.db")
+                logger.warning(f"[{self.name}] No items found in my_trades.db")
                 return []
 
-            # Фильтруем по профиту
+            # Конвертируем в нужный формат для бота
             profitable = []
             for item in items:
-                # Проверяем валидность цен
-                if not item.has_valid_prices:
-                    continue
+                # Items уже отфильтрованы по min_profit в get_active_profitable_items()
+                # Проверяем наличие необходимых полей
+                steam_buy_order = _first_number(item.get('steam_buy_order'), item.get('recommended_buy_order'))
+                csgo_price = _first_number(item.get('csgo_price'))
+                profit_pct = _first_number(item.get('recommended_profit_pct'), item.get('profit_pct'))
 
-                # Проверяем минимальный профит (используем встроенный метод)
-                if not item.is_profitable(min_profit_pct=self.MIN_PROFIT_PCT):
+                if not steam_buy_order or not csgo_price or profit_pct is None:
                     continue
 
                 # Проверяем лимит цены
-                if item.recommended_buy_order > self.account.config.max_price_per_item:
+                recommended_buy = _first_number(item.get('recommended_buy_order'), steam_buy_order)
+                if not recommended_buy:
+                    continue
+                if recommended_buy > self.account.config.max_price_per_item:
                     continue
 
-                # Конвертируем ItemData в словарь для удобства
+                # Конвертируем в формат для бота
                 item_dict = {
-                    'name': item.market_hash_name,  # Alias для удобства
-                    'market_hash_name': item.market_hash_name,
-                    'steam_price': item.recommended_buy_order,
-                    'csgo_price': item.csgo_price,
-                    'csgotm_price': item.csgo_price,  # Alias для совместимости
-                    'profit_pct': item.net_profit_pct,
-                    'net_profit': item.net_profit_after_commission,
-                    'item_type': item.item_type,
-                    'orders_above': item.orders_above,
+                    'name': item['market_hash_name'],
+                    'market_hash_name': item['market_hash_name'],
+                    'steam_price': recommended_buy,
+                    'csgo_price': csgo_price,
+                    'csgotm_price': csgo_price,
+                    'profit_pct': profit_pct,
+                    'net_profit': csgo_price - recommended_buy,  # Approximate
+                    'item_type': item.get('item_type', 'unknown'),
+                    'orders_above': item.get('orders_above', 0),
                 }
                 profitable.append(item_dict)
 
             # Сортируем по профиту (убывание)
-            profitable.sort(key=lambda x: x['profit_pct'], reverse=True)
-
-            # Применяем лимит
-            if limit:
-                profitable = profitable[:limit]
+            profitable.sort(
+                key=lambda x: x.get('profit_pct') if x.get('profit_pct') is not None else float('-inf'),
+                reverse=True
+            )
 
             logger.info(
                 f"[{self.name}] Found {len(profitable)} profitable items "
@@ -240,7 +346,7 @@ class TradingBot:
 
     # ============ Шаг 2: Создание бай-ордеров ============
 
-    def create_buy_orders(self, max_items: Optional[int] = None) -> dict:
+    async def create_buy_orders(self, max_items: Optional[int] = None) -> dict:
         """
         Создать бай-ордера на прибыльные предметы.
 
@@ -259,10 +365,58 @@ class TradingBot:
         if not steamid or not identity_secret:
             logger.warning(f"[{self.name}] Steam ID or identity_secret not available, confirmations may fail")
 
-        # Проверяем баланс
-        balance = self.account.get_wallet_balance()
+        # Настраиваем callback для ручного подтверждения (аккаунты без identity_secret)
+        if not identity_secret:
+            from src.manual_confirmation import ManualConfirmationWaiter
+            waiter = ManualConfirmationWaiter(
+                steam_client=self.account.steam_client,
+                account_name=self.account.name,
+                on_waiting=lambda n, c: logger.info(f"[{n}] ⏳ Подтвердите ордер в Steam Guard на телефоне..."),
+                on_confirmed=lambda n: logger.info(f"[{n}] ✅ Ордер подтверждён! Продолжаем..."),
+            )
+            self.account.steam_client.set_confirmation_callback(waiter.wait_for_confirmation)
+            logger.info(f"[{self.name}] Аккаунт без identity_secret — первый ордер потребует подтверждения на телефоне")
+
+        # Получаем активные ордера из Steam API перед созданием новых
+        logger.info(f"[{self.name}] Fetching existing active orders from Steam...")
+        steam_active_orders = await self.account.steam_client.get_active_buy_orders()
+        steam_active_items = {order['market_hash_name'] for order in steam_active_orders}
+        logger.info(f"[{self.name}] Found {len(steam_active_items)} items with active orders in Steam")
+
+        # Синхронизируем найденные ордера в БД (если их там нет)
+        synced_count = 0
+        for order in steam_active_orders:
+            # Проверяем, есть ли этот ордер в БД
+            existing = trades_db.get_order_by_id(order['order_id'])
+            if not existing:
+                # Добавляем ордер в БД для отслеживания
+                # Используем правильную сигнатуру метода add_order
+                trades_db.add_order(
+                    account_name=self.name,
+                    item_name=order['market_hash_name'],
+                    market_hash_name=order['market_hash_name'],
+                    order_id=order['order_id'],
+                    order_price=order['price'],
+                    quantity=order['quantity'],
+                    expected_sell_price=None,  # Неизвестно для существующих ордеров
+                )
+                synced_count += 1
+                logger.info(f"[{self.name}] 📥 Synced order from Steam to DB: {order['market_hash_name']}")
+
+        if synced_count > 0:
+            logger.info(f"[{self.name}] Synced {synced_count} orders from Steam to local DB")
+
+        # Получаем баланс через sync метод (уже был получен при определении валюты)
+        balance = self.account.get_wallet_balance_sync()
+        # Steam позволяет выставлять ордера на сумму в 10 раз больше баланса
+        max_order_budget = balance * 10.0
+        logger.info(f"[{self.name}] Current balance: {balance:.2f} {self.account.config.currency}")
+        logger.info(f"[{self.name}] Max order budget (x10): {max_order_budget:.2f} {self.account.config.currency}")
+
         if balance < 1.0:
-            logger.warning(f"[{self.name}] Insufficient balance: {balance:.2f}")
+            logger.error(f"[{self.name}] ❌ INSUFFICIENT BALANCE: {balance:.2f} {self.account.config.currency}. Cannot place orders!")
+            logger.error(f"[{self.name}] Please add funds to Steam wallet or check if balance detection is working correctly.")
+            logger.error(f"[{self.name}] Tip: Click '🔍 Валюта' button in GUI to detect currency and refresh balance.")
             return {'success': 0, 'failed': 0, 'skipped': 0, 'confirmed': 0}
 
         # Получаем прибыльные предметы
@@ -292,33 +446,51 @@ class TradingBot:
                 logger.info(f"[{self.name}] Reached budget limit ({self.account.config.total_budget})")
                 break
 
-            # Проверяем баланс
-            steam_price = item.get('steam_price', 0)
-            if balance - total_spent < steam_price:
-                logger.warning(f"[{self.name}] Insufficient balance for {item['name']}")
+            # Проверяем лимит выставления ордеров (Steam позволяет x10 от баланса)
+            steam_price_rub = item.get('steam_price', 0)
+
+            # Конвертируем цену из RUB в валюту аккаунта для корректного сравнения с бюджетом
+            account_currency = self.account.config.currency
+            if account_currency == 'RUB':
+                steam_price = steam_price_rub
+            else:
+                steam_price = currency_converter.convert_from_rub(steam_price_rub, account_currency)
+
+            if total_spent + steam_price > max_order_budget:
+                logger.warning(
+                    f"[{self.name}] Reached max order budget limit: "
+                    f"{total_spent + steam_price:.2f} > {max_order_budget:.2f} {account_currency} ({item['name']})"
+                )
                 skipped_count += 1
                 continue
 
-            # Проверяем цену предмета (фильтр для выставления ордеров)
-            if steam_price < self.TRADE_MIN_PRICE:
-                logger.debug(f"[{self.name}] Item too cheap: {item['name']} ({steam_price:.2f} < {self.TRADE_MIN_PRICE})")
+            # Проверяем цену предмета (фильтр для выставления ордеров) - используем цену в RUB
+            if steam_price_rub < self.TRADE_MIN_PRICE:
+                logger.debug(f"[{self.name}] Item too cheap: {item['name']} ({steam_price_rub:.2f} < {self.TRADE_MIN_PRICE})")
                 skipped_count += 1
                 continue
 
-            if steam_price > self.TRADE_MAX_PRICE:
-                logger.debug(f"[{self.name}] Item too expensive: {item['name']} ({steam_price:.2f} > {self.TRADE_MAX_PRICE})")
+            if steam_price_rub > self.TRADE_MAX_PRICE:
+                logger.debug(f"[{self.name}] Item too expensive: {item['name']} ({steam_price_rub:.2f} > {self.TRADE_MAX_PRICE})")
                 skipped_count += 1
                 continue
 
             # Проверяем, нет ли уже активного ордера на этот предмет
-            existing_order = trades_db.get_order_by_item_name(item['name'])
+            # 1. Проверяем Steam API (актуальная информация)
+            if item['name'] in steam_active_items:
+                logger.info(f"[{self.name}] ⏭️ Active order already exists in Steam: {item['name']}")
+                skipped_count += 1
+                continue
+
+            # 2. Проверяем локальную БД (на случай если синхронизация отстала) — только этот аккаунт
+            existing_order = trades_db.get_order_by_item_name(item['name'], account_name=self.name)
             if existing_order:
-                logger.debug(f"[{self.name}] Order already exists for {item['name']}")
+                logger.debug(f"[{self.name}] Order already exists in DB: {item['name']}")
                 skipped_count += 1
                 continue
 
             # ВАЖНО: Проверяем актуальность цен перед созданием ордера
-            verification = self._verify_item_profitability(item)
+            verification = await self._verify_item_profitability(item)
 
             if not verification['is_profitable']:
                 logger.warning(
@@ -326,57 +498,80 @@ class TradingBot:
                     f"{verification.get('reason', 'unknown')}"
                 )
                 skipped_count += 1
+                # Задержка перед следующей проверкой (rate limiting)
+                await asyncio.sleep(3.0)
                 continue
 
             # Обновляем цену на актуальную
             item['steam_price'] = verification['recommended_price']
+            item['recommended_price'] = verification['recommended_price']  # Для телеграм уведомлений
             item['csgotm_price'] = verification['current_csgotm_price']
             item['profit_pct'] = verification['current_profit_pct']
-            steam_price = item['steam_price']  # Обновляем локальную переменную
+            steam_price_rub = item['steam_price']  # Цена в RUB
+
+            # Конвертируем цену в валюту аккаунта для учета в бюджете
+            if account_currency == 'RUB':
+                steam_price = steam_price_rub
+            else:
+                steam_price = currency_converter.convert_from_rub(steam_price_rub, account_currency)
+
+            # Задержка перед созданием ордера (rate limiting)
+            logger.debug(f"[{self.name}] Waiting 3s before creating order...")
+            await asyncio.sleep(3.0)
+
+            # Задержка перед созданием ордера (rate limiting)
+            logger.debug(f"[{self.name}] Waiting 3s before creating order...")
+            await asyncio.sleep(3.0)
 
             # Создаем ордер
             try:
-                result = self._create_buy_order_for_item(item)
+                result = await self._create_buy_order_for_item(item)
 
                 if result['success']:
                     success_count += 1
                     total_spent += steam_price
+                    # НЕ считаем ордер подтверждённым здесь: новый Steam может вернуть
+                    # success+buy_orderid, но оставить ордер в состоянии "ожидает подтверждения".
+                    # Реальное подтверждение делаем явно после батча (confirm_pending_market).
                     logger.info(
-                        f"[{self.name}] ✅ Order created: {item['name']} @ {steam_price:.2f} "
-                        f"(profit: {item['profit_pct']:.1f}%)"
+                        f"[{self.name}] ✅ Order created: {item['name']} @ "
+                        f"{steam_price_rub:.2f} RUB (profit: {item['profit_pct']:.1f}%)"
                     )
-
-                    # ВАЖНО: Подтверждаем ордер сразу после создания
-                    # Steam блокирует новые ордера, если предыдущие не подтверждены
-                    if steamid and identity_secret:
-                        logger.info(f"[{self.name}] Confirming order...")
-                        time.sleep(3)  # Даем Steam время зарегистрировать ордер
-
-                        confirm_result = self.account.steam_client.confirm_all_market_transactions(
-                            identity_secret=identity_secret,
-                            steamid=steamid
-                        )
-
-                        if confirm_result > 0:
-                            confirmed_count += confirm_result
-                            logger.info(f"[{self.name}] ✅ Order confirmed")
-                        else:
-                            logger.warning(f"[{self.name}] No confirmation found (may not require confirmation)")
                 else:
                     failed_count += 1
-                    logger.warning(f"[{self.name}] ❌ Order failed: {item['name']}")
-
-                # Задержка между ордерами (rate limiting)
-                time.sleep(2)
+                    message = result.get('message', 'Unknown error')
+                    logger.warning(f"[{self.name}] ❌ Order failed: {item['name']} - {message}")
+                    if self._is_rate_limit_error(message):
+                        logger.warning(
+                            f"[{self.name}] Steam rate limit while creating orders. "
+                            f"Cooling down for {self.ORDER_RATE_LIMIT_COOLDOWN}s and stopping this buy cycle."
+                        )
+                        await asyncio.sleep(self.ORDER_RATE_LIMIT_COOLDOWN)
+                        break
 
             except Exception as e:
                 logger.error(f"[{self.name}] Error creating order for {item['name']}: {e}")
                 failed_count += 1
 
+            # Задержка между попытками создания ордера (rate limiting)
+            # Увеличиваем задержку до 5 секунд чтобы избежать 429 ошибок
+            await asyncio.sleep(5.0)
+
+        # ЯВНОЕ подтверждение ожидающих market-подтверждений (buy-ордера в состоянии pending).
+        # Новый Steam может создать ордер без флага need_confirmation → aiosteampy его не
+        # подтверждает сам, и ордер висит неактивным. Здесь добираем их через maFile.
+        if success_count > 0 and identity_secret:
+            try:
+                # Даём Steam время создать confirmations
+                await asyncio.sleep(3)
+                confirmed_count = await self.account.steam_client.confirm_pending_market()
+            except Exception as e:
+                logger.error(f"[{self.name}] Failed to confirm pending orders: {e}")
+
         logger.info(
             f"[{self.name}] Buy orders complete: "
-            f"{success_count} success, {failed_count} failed, {skipped_count} skipped, "
-            f"{confirmed_count} confirmed"
+            f"{success_count} success, "
+            f"{failed_count} failed, {skipped_count} skipped, {confirmed_count} confirmed"
         )
 
         return {
@@ -387,7 +582,7 @@ class TradingBot:
             'confirmed': confirmed_count,
         }
 
-    def _create_buy_order_for_item(self, item: dict) -> dict:
+    async def _create_buy_order_for_item(self, item: dict) -> dict:
         """
         Создать бай-ордер для одного предмета.
 
@@ -400,38 +595,183 @@ class TradingBot:
         market_hash_name = item['name']
         price = item['steam_price']
         expected_sell_price = item.get('csgotm_price', 0)
+        no_identity_secret = not self.account.config.steam_identity_secret
 
-        try:
-            # Создаем ордер через Steam client
-            result = self.account.steam_client.create_buy_order(
+        async def _try_create():
+            return await self.account.steam_client.create_buy_order(
                 market_hash_name=market_hash_name,
                 price=price,
                 quantity=1
             )
 
-            if result.success and result.order_id:
-                # Добавляем в БД
-                trades_db.add_order(
-                    account_name=self.name,
-                    item_name=market_hash_name,
-                    market_hash_name=market_hash_name,
-                    order_id=result.order_id,
-                    order_price=price,
-                    quantity=1,
-                    expected_sell_price=expected_sell_price,
+        try:
+            result = await _try_create()
+        except Exception as e:
+            error_str = str(e)
+            is_rate_limit = (
+                'RATE_LIMIT_EXCEEDED' in error_str or
+                'too many purchases without confirmation' in error_str.lower()
+            )
+            if is_rate_limit and no_identity_secret:
+                logger.warning(
+                    f"[{self.account.name}] ⚠️ Steam требует подтверждения ожидающих ордеров перед созданием новых. "
+                    f"Подтвердите ВСЕ ордера в Steam Guard на телефоне."
                 )
-
-                return {'success': True, 'order_id': result.order_id}
+                # Сбрасываем флаг чтобы следующий ордер прошёл через поллинг подтверждения
+                self.account.steam_client.reset_confirmation_state()
+                # Даём время на подтверждение
+                logger.info(f"[{self.account.name}] Ожидание 30 секунд для подтверждения ордеров...")
+                await asyncio.sleep(30)
+                try:
+                    result = await _try_create()
+                except Exception as retry_e:
+                    logger.error(f"[{self.name}] Retry after confirmation also failed: {retry_e}")
+                    return {'success': False, 'message': str(retry_e)}
             else:
-                return {'success': False, 'message': result.message}
+                logger.error(f"[{self.name}] Failed to create order: {e}")
+                return {'success': False, 'message': str(e)}
+
+        if result.success:
+            trades_db.add_order(
+                account_name=self.name,
+                item_name=market_hash_name,
+                market_hash_name=market_hash_name,
+                order_id=result.order_id,
+                order_price=price,
+                quantity=1,
+                expected_sell_price=expected_sell_price,
+            )
+            try:
+                from src.telegram_bot import telegram_bot
+                telegram_bot.notify_order_placed(
+                    item_name=market_hash_name,
+                    steam_price=price,
+                    csgotm_price=expected_sell_price,
+                    recommended_price=item.get('recommended_price', price),
+                    profit_pct=item.get('profit_pct', 0),
+                    account_name=self.name
+                )
+            except Exception as e:
+                logger.warning(f"[{self.name}] Failed to send Telegram notification: {e}")
+            return {'success': True, 'order_id': result.order_id}
+        else:
+            return {'success': False, 'message': result.error or 'Unknown error'}
+
+    # ============ Шаг 2.5: Синхронизация статусов ордеров ============
+
+    async def sync_order_statuses(self) -> dict:
+        """
+        Синхронизировать статусы ордеров с Steam API.
+
+        Получает активные ордера из Steam и сравнивает с БД:
+        - Если ордер есть в БД но нет в Steam - помечает как cancelled
+        - Если quantity_remaining = 0 - помечает как filled
+
+        Returns:
+            Dict with counts: {'cancelled': int, 'still_active': int}
+        """
+        logger.info(f"[{self.name}] Syncing order statuses with Steam...")
+
+        try:
+            # Получаем активные ордера из Steam
+            steam_orders = await self.account.steam_client.get_active_buy_orders()
+            steam_order_ids = {order['order_id'] for order in steam_orders}
+
+            logger.info(f"[{self.name}] Steam has {len(steam_order_ids)} active orders")
+
+            # Получаем активные ордера из БД
+            db_orders = [
+                order for order in trades_db.get_active_orders()
+                if order['account_name'] == self.name
+            ]
+
+            logger.info(f"[{self.name}] Database has {len(db_orders)} active orders")
+
+            # Находим ордера, которых нет в Steam (исполнены или отменены)
+            missing_orders = [
+                order for order in db_orders
+                if str(order['order_id']) not in steam_order_ids
+            ]
+
+            cancelled_count = 0
+            filled_count = 0
+
+            # Загружаем инвентарь ОДИН раз, если есть ордера для проверки
+            # Подсчитываем КОЛИЧЕСТВО каждого предмета в инвентаре
+            inventory_counts = {}
+            if missing_orders:
+                inventory = await self.account.steam_client.get_inventory()
+                if inventory:
+                    for item in inventory:
+                        name = item.market_hash_name
+                        inventory_counts[name] = inventory_counts.get(name, 0) + 1
+
+            # Учитываем УЖЕ СУЩЕСТВУЮЩИЕ purchased_items для этого аккаунта
+            # Это предотвращает дублирование когда несколько ордеров на один предмет
+            existing_purchased = trades_db.get_purchased_items(account_name=self.name)
+            matched_counts = {}
+            for item in existing_purchased:
+                name = item.get('market_hash_name', '')
+                if name:
+                    matched_counts[name] = matched_counts.get(name, 0) + 1
+
+            # Проверяем каждый пропавший ордер
+            for order in missing_orders:
+                order_id = str(order['order_id'])
+                market_hash_name = order.get('market_hash_name', '')
+
+                # Проверяем, есть ли предмет в инвентаре (= ордер исполнен)
+                # И есть ли ещё несопоставленные предметы этого типа
+                available_count = inventory_counts.get(market_hash_name, 0)
+                matched_count = matched_counts.get(market_hash_name, 0)
+
+                if market_hash_name and available_count > matched_count:
+                    logger.info(
+                        f"[{self.name}] ✅ Order {order_id} FILLED: {order['item_name']} "
+                        f"(inventory: {available_count}, matched: {matched_count + 1})"
+                    )
+                    trades_db.update_order_status(order_id, 'filled')
+
+                    # Добавляем в purchased_items с 7-дневным холдом
+                    trades_db.add_purchased_item(
+                        account_name=self.name,
+                        item_name=order['item_name'],
+                        market_hash_name=market_hash_name,
+                        purchase_price=order['order_price'],
+                        expected_sell_price=order.get('expected_sell_price'),
+                        order_id=order['order_id'],
+                    )
+                    filled_count += 1
+                    # Увеличиваем счётчик сопоставленных предметов
+                    matched_counts[market_hash_name] = matched_count + 1
+                else:
+                    logger.info(
+                        f"[{self.name}] ❌ Order {order_id} CANCELLED: {order['item_name']} "
+                        f"(inventory: {available_count}, already matched: {matched_count})"
+                    )
+                    trades_db.update_order_status(order_id, 'cancelled')
+                    cancelled_count += 1
+
+            logger.info(
+                f"[{self.name}] Sync complete: {filled_count} filled, {cancelled_count} cancelled, "
+                f"{len(steam_order_ids)} still active"
+            )
+
+            return {
+                'filled': filled_count,
+                'cancelled': cancelled_count,
+                'still_active': len(steam_order_ids)
+            }
 
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to create order: {e}")
-            return {'success': False, 'message': str(e)}
+            logger.error(f"[{self.name}] Error syncing order statuses: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'cancelled': 0, 'still_active': 0}
 
     # ============ Шаг 3: Проверка исполненных ордеров ============
 
-    def check_filled_orders(self) -> int:
+    async def check_filled_orders(self) -> int:
         """
         Проверить исполненные ордера и добавить предметы в purchased_items.
 
@@ -450,16 +790,38 @@ class TradingBot:
             logger.debug(f"[{self.name}] No active orders to check")
             return 0
 
+        # Загружаем инвентарь ОДИН раз для всех проверок
+        inventory = await self.account.steam_client.get_inventory()
+        if not inventory:
+            logger.debug(f"[{self.name}] Inventory is empty or failed to fetch")
+            return 0
+
+        # Подсчитываем КОЛИЧЕСТВО каждого предмета в инвентаре
+        inventory_counts = {}
+        for item in inventory:
+            name = item.market_hash_name
+            inventory_counts[name] = inventory_counts.get(name, 0) + 1
+
+        # Учитываем УЖЕ СУЩЕСТВУЮЩИЕ purchased_items для этого аккаунта
+        existing_purchased = trades_db.get_purchased_items(account_name=self.name)
+        matched_counts = {}
+        for item in existing_purchased:
+            name = item.get('market_hash_name', '')
+            if name:
+                matched_counts[name] = matched_counts.get(name, 0) + 1
+
         filled_count = 0
 
         for order in active_orders:
             try:
-                # Проверяем статус ордера в Steam
-                # TODO: Implement order status check in steam_client
-                # For now, we'll check inventory for the item
-                is_filled = self._check_order_filled(order)
+                market_hash_name = order.get('market_hash_name', '')
 
-                if is_filled:
+                # Проверяем есть ли предмет в инвентаре
+                # И есть ли ещё несопоставленные предметы этого типа
+                available_count = inventory_counts.get(market_hash_name, 0)
+                matched_count = matched_counts.get(market_hash_name, 0)
+
+                if market_hash_name and available_count > matched_count:
                     # Отмечаем ордер как исполненный
                     trades_db.update_order_status(order['order_id'], 'filled')
 
@@ -467,16 +829,19 @@ class TradingBot:
                     trades_db.add_purchased_item(
                         account_name=self.name,
                         item_name=order['item_name'],
-                        market_hash_name=order.get('market_hash_name', order['item_name']),
+                        market_hash_name=market_hash_name,
                         purchase_price=order['order_price'],
                         expected_sell_price=order.get('expected_sell_price'),
                         order_id=order['order_id'],
                     )
 
                     filled_count += 1
-                    logger.info(f"[{self.name}] ✅ Order filled: {order['item_name']}")
-
-                time.sleep(2)  # Rate limiting
+                    # Увеличиваем счётчик сопоставленных предметов
+                    matched_counts[market_hash_name] = matched_count + 1
+                    logger.info(
+                        f"[{self.name}] ✅ Order filled: {order['item_name']} "
+                        f"(inventory: {available_count}, matched: {matched_count + 1})"
+                    )
 
             except Exception as e:
                 logger.error(f"[{self.name}] Error checking order {order['order_id']}: {e}")
@@ -486,50 +851,9 @@ class TradingBot:
 
         return filled_count
 
-    def _check_order_filled(self, order: dict) -> bool:
-        """
-        Проверить, исполнен ли ордер (есть ли предмет в инвентаре).
-
-        Args:
-            order: Order data with 'market_hash_name' field
-
-        Returns:
-            True if order is filled (item found in inventory)
-        """
-        try:
-            # Получаем инвентарь Steam
-            inventory = self.account.steam_client.get_inventory()
-
-            if not inventory:
-                logger.debug(f"[{self.name}] Inventory is empty or failed to fetch")
-                return False
-
-            # Ищем предмет по market_hash_name
-            market_hash_name = order.get('market_hash_name', '')
-            if not market_hash_name:
-                logger.warning(f"[{self.name}] Order #{order.get('id')} has no market_hash_name")
-                return False
-
-            # Проверяем есть ли предмет в инвентаре
-            for item in inventory:
-                if item.market_hash_name == market_hash_name:
-                    logger.info(
-                        f"[{self.name}] ✅ Order filled! Found '{market_hash_name}' "
-                        f"in inventory (asset_id: {item.asset_id})"
-                    )
-                    return True
-
-            # Предмет не найден
-            logger.debug(f"[{self.name}] Item '{market_hash_name}' not yet in inventory")
-            return False
-
-        except Exception as e:
-            logger.error(f"[{self.name}] Error checking order status: {e}")
-            return False
-
     # ============ Шаг 4: Продажа предметов после холда ============
 
-    def sell_ready_items(self) -> int:
+    async def sell_ready_items(self) -> int:
         """
         Продать предметы, прошедшие 7-дневный холд.
 
@@ -563,7 +887,7 @@ class TradingBot:
                     continue
 
                 # Продаем на CSGO.TM
-                result = self._sell_item_on_csgotm(item, current_price)
+                result = await self._sell_item_on_csgotm(item, current_price)
 
                 if result['success']:
                     # Обновляем статус в БД
@@ -582,7 +906,7 @@ class TradingBot:
                     listed_count += 1
                     logger.info(f"[{self.name}] ✅ Listed for sale: {item['item_name']} @ {current_price:.2f}")
 
-                time.sleep(5)  # Rate limiting
+                await asyncio.sleep(5)  # Rate limiting
 
             except Exception as e:
                 logger.error(f"[{self.name}] Error selling item {item['item_name']}: {e}")
@@ -611,7 +935,7 @@ class TradingBot:
             logger.error(f"[{self.name}] Failed to get CSGO.TM price for {item_name}: {e}")
             return None
 
-    def _sell_item_on_csgotm(self, item: dict, price: float) -> dict:
+    async def _sell_item_on_csgotm(self, item: dict, price: float) -> dict:
         """
         Выставить предмет на продажу на CSGO.TM.
 
@@ -631,7 +955,7 @@ class TradingBot:
             market_hash_name = item.get('market_hash_name', item.get('item_name'))
 
             # Шаг 1: Найти предмет в инвентаре Steam
-            inventory = self.account.steam_client.get_inventory()
+            inventory = await self.account.steam_client.get_inventory()
 
             if not inventory:
                 logger.warning(f"[{self.name}] Inventory is empty or failed to fetch")
@@ -689,9 +1013,50 @@ class TradingBot:
             logger.error(f"[{self.name}] Error selling item on CSGO.TM: {e}")
             return {'success': False, 'message': str(e)}
 
+    # ============ Background Tasks ============
+
+    async def auto_sync_orders(self, interval: int = 300):
+        """
+        Автоматическая периодическая синхронизация ордеров в фоне.
+
+        Args:
+            interval: Интервал синхронизации в секундах (по умолчанию 5 минут)
+        """
+        logger.info(f"[{self.name}] Starting auto-sync orders task (interval: {interval}s)")
+
+        while True:
+            try:
+                await asyncio.sleep(interval)
+
+                # Проверяем, что клиент залогинен
+                if not self.account.is_logged_in():
+                    logger.debug(f"[{self.name}] Auto-sync: not logged in, skipping")
+                    continue
+
+                logger.info(f"[{self.name}] 🔄 Auto-sync: syncing order statuses...")
+                sync_results = await self.sync_order_statuses()
+                logger.info(
+                    f"[{self.name}] Auto-sync complete: "
+                    f"{sync_results['cancelled']} cancelled, "
+                    f"{sync_results['still_active']} active"
+                )
+
+                # Проверяем заполненные ордера
+                logger.info(f"[{self.name}] 🔄 Auto-sync: checking filled orders...")
+                filled_count = await self.check_filled_orders()
+                if filled_count > 0:
+                    logger.info(f"[{self.name}] Auto-sync: {filled_count} orders filled!")
+
+            except asyncio.CancelledError:
+                logger.info(f"[{self.name}] Auto-sync task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[{self.name}] Error in auto-sync: {e}")
+                # Продолжаем работу несмотря на ошибку
+
     # ============ Main Loop ============
 
-    def run_cycle(self) -> dict:
+    async def run_cycle(self) -> dict:
         """
         Выполнить один цикл торговли:
         1. Создать бай-ордера
@@ -703,31 +1068,53 @@ class TradingBot:
         """
         logger.info(f"[{self.name}] ===== Running trading cycle =====")
 
+        # Проверяем, что клиенты инициализированы
+        if not self.account.is_logged_in():
+            logger.error(f"[{self.name}] Steam client not logged in")
+            return {'orders_created': 0, 'orders_filled': 0, 'items_listed': 0}
+
+        if not self.account.csgotm_client:
+            logger.error(f"[{self.name}] CSGO.TM client not initialized")
+            return {'orders_created': 0, 'orders_filled': 0, 'items_listed': 0}
+
         stats = {
             'orders_created': 0,
             'orders_filled': 0,
             'items_listed': 0,
+            'orders_synced': 0,
+            'orders_cancelled': 0,
         }
 
         try:
+            # Шаг 0: Синхронизировать статусы ордеров с Steam
+            logger.info(f"[{self.name}] Step 0: Syncing order statuses...")
+            sync_results = await self.sync_order_statuses()
+            stats['orders_synced'] = sync_results['still_active']
+            stats['orders_cancelled'] = sync_results['cancelled']
+
             # Шаг 1: Создать ордера
-            order_results = self.create_buy_orders()
+            logger.info(f"[{self.name}] Step 1: Creating buy orders...")
+            order_results = await self.create_buy_orders()
             stats['orders_created'] = order_results['success']
 
-            # Шаг 2: Проверить исполненные ордера
-            filled_count = self.check_filled_orders()
+            # Шаг 2: Проверить исполненные ордера (ищем купленные предметы в инвентаре)
+            logger.info(f"[{self.name}] Step 2: Checking filled orders...")
+            filled_count = await self.check_filled_orders()
             stats['orders_filled'] = filled_count
 
-            # Шаг 3: Продать готовые предметы
-            listed_count = self.sell_ready_items()
-            stats['items_listed'] = listed_count
+            # TODO: Шаг 3: Продать готовые предметы (пока отключено)
+            # logger.info(f"[{self.name}] Step 3: Selling ready items...")
+            # listed_count = await self.sell_ready_items()
+            # stats['items_listed'] = listed_count
 
         except Exception as e:
             logger.error(f"[{self.name}] Error in trading cycle: {e}")
 
         logger.info(
             f"[{self.name}] Cycle complete: "
-            f"{stats['orders_created']} orders, "
+            f"{stats['orders_cancelled']} cancelled, "
+            f"{stats['orders_synced']} active, "
+            f"{stats['orders_created']} created, "
             f"{stats['orders_filled']} filled, "
             f"{stats['items_listed']} listed"
         )

@@ -1,0 +1,22 @@
+# Ротация логов бота. Установить в /etc/logrotate.d/tm-steambot
+# Путь подставь свой (WorkingDirectory из юнита).
+#
+# copytruncate обязателен: server_runner держит файл открытым, а copytruncate
+# копирует лог и обрезает его "на месте" (тот же inode) — не нужно перезапускать службу.
+
+/opt/tm-steambot/logs/bot.log {
+    daily
+    rotate 14
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+
+    # Архивы живут 14 дней и хранят операционные подробности бота, поэтому
+    # читать их должен только владелец. Без create/su ротированные .gz
+    # наследовали umask root'а и оказывались доступны всем (644).
+    su botuser botuser
+    create 0600 botuser botuser
+}

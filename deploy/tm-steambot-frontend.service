@@ -1,0 +1,58 @@
+[Unit]
+Description=TM Steam Bot — фронтенд веб-панели (Next.js)
+After=network-online.target tm-steambot-web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- ПОДСТАВЬ СВОИ ЗНАЧЕНИЯ ---
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/tm-steambot/web/frontend
+# Зовём next напрямую, а не `npm run start`: в package.json порт уже задан
+# (`next start -p 3002`), и дописанный через `--` второй -p конфликтует.
+# -H 127.0.0.1 обязателен: по умолчанию Next слушает 0.0.0.0, и панель
+# оказалась бы доступна из интернета в обход SSH-туннеля.
+ExecStart=/opt/tm-steambot/web/frontend/node_modules/.bin/next start -H 127.0.0.1 -p 3002
+# ------------------------------
+
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+# --- Изоляция -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+
+# Next.js пишет кеш в .next во время работы
+ReadWritePaths=/opt/tm-steambot/web/frontend/.next
+
+UMask=0077
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
